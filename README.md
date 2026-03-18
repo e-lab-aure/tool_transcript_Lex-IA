@@ -31,6 +31,10 @@ Ouvre http://localhost:5000
 update.bat
 ```
 
+## Architecture
+
+![Architecture LEX-IA](docs/lex_ia_architecture.svg)
+
 ## Fonctionnalités
 - URL YouTube ou fichier local (drag & drop)
 - Détection automatique de la langue
