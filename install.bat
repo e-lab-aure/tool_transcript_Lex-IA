@@ -53,6 +53,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo [5b/5] Fix compatibilite peft / Canary-Qwen-2.5B ^(Qwen3Model^)...
+.venv\Scripts\pip.exe install "peft==0.12.0"
+if errorlevel 1 (
+    echo [ERREUR] Fix peft echoue.
+    pause
+    exit /b 1
+)
+
 echo.
 echo [TEST] Verification CUDA...
 .venv\Scripts\python.exe -c "import torch; print('  PyTorch :', torch.__version__); print('  CUDA dispo :', torch.cuda.is_available()); print('  GPU :', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NON DETECTE')"
