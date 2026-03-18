@@ -1,0 +1,6 @@
+flask>=3.0.0
+faster-whisper>=1.0.0
+yt-dlp
+soundfile
+numpy
+# PyTorch cu128 et NeMo installes separement via install.bat
