@@ -246,8 +246,9 @@
             <div class="progress-bar-track"><div class="progress-bar-fill" id="progress-fill"></div></div>
             <div class="progress-label" id="progress-label">Envoi en cours...</div>
           </div>
-          <div style="margin-top:12px;">
-            <button id="btn-submit-file" style="width:100%;background:var(--accent);color:#0c0c0e;border:none;border-radius:10px;padding:14px;font-family:var(--font-display);font-size:14px;font-weight:700;cursor:pointer;transition:background 0.2s;">Transcrire</button>
+          <div style="margin-top:12px;display:flex;gap:8px;">
+            <button id="btn-submit-file" style="flex:1;background:var(--accent);color:#0c0c0e;border:none;border-radius:10px;padding:14px;font-family:var(--font-display);font-size:14px;font-weight:700;cursor:pointer;transition:background 0.2s;">Transcrire</button>
+            <button id="btn-test-15s" style="display:none;background:var(--bg);color:var(--accent);border:1px solid rgba(232,255,71,0.4);border-radius:10px;padding:14px 16px;font-family:var(--font-mono);font-size:12px;cursor:pointer;white-space:nowrap;transition:border-color 0.2s,color 0.2s;" title="Lance le pipeline complet sur les 15 premières secondes">Test 15s</button>
           </div>
         </div>
 
@@ -290,12 +291,16 @@
             <div class="option-title">Diarisation</div>
             <div class="option-hint">identification des locuteurs · nécessite HF_TOKEN</div>
           </div>
-          <label class="pill-toggle" title="Identifier qui parle et quand (pyannote · HF_TOKEN requis)">
-            <input type="checkbox" id="toggle-diarize" />
-            <span class="pill-track"></span>
-            <span class="pill-thumb"></span>
-          </label>
+          <div style="display:flex;align-items:center;gap:10px;flex-shrink:0;">
+            <button class="btn-action" id="btn-test-diarize" style="font-size:11px;padding:5px 10px;" onclick="testDiarize()">Tester</button>
+            <label class="pill-toggle" title="Identifier qui parle et quand (pyannote · HF_TOKEN requis)">
+              <input type="checkbox" id="toggle-diarize" />
+              <span class="pill-track"></span>
+              <span class="pill-thumb"></span>
+            </label>
+          </div>
         </div>
+        <div id="diarize-test-result" style="display:none;font-family:var(--font-mono);font-size:11px;padding:8px 12px;border-radius:6px;margin-top:-8px;"></div>
       </div>
 
       <div class="status-bar" id="status-bar">
@@ -314,11 +319,13 @@
             <span class="result-tag lang" id="result-lang"></span>
             <span class="result-tag" id="result-model"></span>
             <span class="result-tag model-canary" id="result-diarized" style="display:none">Diarisation</span>
+            <span class="result-tag" id="result-test-mode" style="display:none;border-color:rgba(232,255,71,0.4);color:var(--accent)">Test 15s</span>
           </div>
         </div>
         <div class="actions">
           <button class="btn-action" id="btn-copy">Copier</button>
           <button class="btn-action" id="btn-download">Télécharger .txt</button>
+          <button class="btn-action" id="btn-download-audio" style="display:none">Télécharger .mp3</button>
         </div>
       </div>
       <textarea id="transcript-output" readonly></textarea>
@@ -357,8 +364,10 @@
     const resultLang    = document.getElementById('result-lang');
     const resultModel   = document.getElementById('result-model');
     const transcriptEl  = document.getElementById('transcript-output');
-    const btnCopy       = document.getElementById('btn-copy');
-    const btnDownload   = document.getElementById('btn-download');
+    const btnCopy          = document.getElementById('btn-copy');
+    const btnDownload      = document.getElementById('btn-download');
+    const btnDownloadAudio = document.getElementById('btn-download-audio');
+    const btnTest15s       = document.getElementById('btn-test-15s');
     const dropZone      = document.getElementById('drop-zone');
     const fileInput     = document.getElementById('file-input');
     const dropIdle      = document.getElementById('drop-idle');
@@ -406,12 +415,14 @@
       dropIdle.style.display = 'none';
       dropSelected.style.display = '';
       dropZone.classList.add('has-file');
+      btnTest15s.style.display = '';
     }
     function clearFile(e) {
       e.stopPropagation();
       selectedFile = null; fileInput.value = '';
       dropIdle.style.display = ''; dropSelected.style.display = 'none';
       dropZone.classList.remove('has-file');
+      btnTest15s.style.display = 'none';
     }
     function formatSize(b) { return b < 1048576 ? (b/1024).toFixed(1)+' Ko' : (b/1048576).toFixed(1)+' Mo'; }
 
@@ -473,12 +484,12 @@
           if (job.status === 'done') {
             stopPolling(); await pollLogs(jobId);
             setConsoleDot('done');
-            btnSubmit.disabled = false; btnSubmitFile.disabled = false;
-            showResult(job);
+            btnSubmit.disabled = false; btnSubmitFile.disabled = false; btnTest15s.disabled = false;
+            showResult(job, jobId);
           } else if (job.status === 'error') {
             stopPolling(); await pollLogs(jobId);
             setConsoleDot('error');
-            btnSubmit.disabled = false; btnSubmitFile.disabled = false;
+            btnSubmit.disabled = false; btnSubmitFile.disabled = false; btnTest15s.disabled = false;
             errorMsg.textContent = job.error || 'Erreur inconnue';
             errorMsg.classList.add('visible');
           }
@@ -509,10 +520,11 @@
     }
 
     // ---- Submit File ----
-    async function startFromFile() {
+    async function startFromFile(testMode = false) {
       if (!selectedFile) { dropZone.style.borderColor = 'var(--error)'; setTimeout(() => dropZone.style.borderColor = '', 1000); return; }
       initJob();
       btnSubmitFile.disabled = true;
+      btnTest15s.disabled = true;
       setStatus('uploading');
       uploadProgress.classList.add('visible');
       progressFill.style.width = '0%';
@@ -522,6 +534,7 @@
       formData.append('language', langSelect.value);
       formData.append('preprocess', document.getElementById('toggle-preprocess').checked ? 'true' : 'false');
       formData.append('diarize', document.getElementById('toggle-diarize').checked ? 'true' : 'false');
+      formData.append('test_mode', testMode ? 'true' : 'false');
 
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/transcribe-file');
@@ -538,7 +551,7 @@
         if (data.error) {
           setStatus('error'); setConsoleDot('error');
           errorMsg.textContent = data.error; errorMsg.classList.add('visible');
-          btnSubmitFile.disabled = false; return;
+          btnSubmitFile.disabled = false; btnTest15s.disabled = false; return;
         }
         setStatus('queued');
         startPolling(data.job_id);
@@ -548,13 +561,13 @@
         setStatus('error'); setConsoleDot('error');
         errorMsg.textContent = 'Erreur réseau lors de l\'envoi';
         errorMsg.classList.add('visible');
-        btnSubmitFile.disabled = false;
+        btnSubmitFile.disabled = false; btnTest15s.disabled = false;
       });
       xhr.send(formData);
     }
 
     // ---- Result ----
-    function showResult(job) {
+    function showResult(job, jobId) {
       resultTitle.textContent = job.title || 'Transcription';
       resultLang.textContent = job.language ? job.language.toUpperCase() : '';
       resultLang.style.display = job.language ? '' : 'none';
@@ -562,6 +575,9 @@
       resultModel.textContent = job.model_used || '';
       resultModel.className = 'result-tag ' + (isCanary ? 'model-canary' : 'model-whisper');
       document.getElementById('result-diarized').style.display = job.diarized ? '' : 'none';
+      document.getElementById('result-test-mode').style.display = job.test_mode ? '' : 'none';
+      btnDownloadAudio.style.display = job.audio_available ? '' : 'none';
+      btnDownloadAudio.onclick = () => { window.location.href = '/download-audio/' + jobId; };
       transcriptEl.value = job.transcript || '';
 
       resultCard.classList.add('visible');
@@ -589,8 +605,32 @@
     window.addEventListener('resize', fitTextarea);
 
     btnSubmit.addEventListener('click', startFromUrl);
-    btnSubmitFile.addEventListener('click', startFromFile);
+    btnSubmitFile.addEventListener('click', () => startFromFile(false));
+    btnTest15s.addEventListener('click', () => startFromFile(true));
     urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') startFromUrl(); });
+
+    // ---- Test diarize ----
+    async function testDiarize() {
+      const btn    = document.getElementById('btn-test-diarize');
+      const result = document.getElementById('diarize-test-result');
+      btn.disabled = true; btn.textContent = '...';
+      result.style.cssText = 'display:block;font-family:var(--font-mono);font-size:11px;padding:8px 12px;border-radius:6px;margin-top:-8px;border:1px solid var(--border);color:var(--muted);background:rgba(255,255,255,0.02)';
+      result.textContent = 'Test en cours...';
+      try {
+        const data = await fetch('/test-diarize').then(r => r.json());
+        if (data.ok) {
+          result.style.color = 'var(--success)'; result.style.borderColor = 'rgba(71,255,176,0.3)';
+          result.textContent = '✓ ' + data.message;
+        } else {
+          result.style.color = 'var(--error)'; result.style.borderColor = 'rgba(255,79,79,0.3)';
+          result.textContent = '✗ ' + (data.error || 'Erreur inconnue');
+        }
+      } catch (_) {
+        result.style.color = 'var(--error)';
+        result.textContent = '✗ Erreur réseau';
+      }
+      btn.disabled = false; btn.textContent = 'Tester';
+    }
 
     btnCopy.addEventListener('click', () => {
       navigator.clipboard.writeText(transcriptEl.value).then(() => {

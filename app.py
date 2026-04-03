@@ -13,7 +13,7 @@ from datetime import datetime
 import numpy as np
 import soundfile as sf
 import torch
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 
 try:
     from dotenv import load_dotenv
@@ -76,7 +76,8 @@ SUPPORTED_LANGUAGES = {
 # ---------------------------------------------------------------------------
 # Store des jobs
 # ---------------------------------------------------------------------------
-jobs: dict = {}
+jobs: dict        = {}
+_audio_files: dict = {}  # job_id -> chemin MP3 persistant
 
 
 def _new_job(title: str | None = None) -> dict:
@@ -86,9 +87,11 @@ def _new_job(title: str | None = None) -> dict:
         "transcript": None,
         "language":   None,
         "model_used": None,
-        "diarized":   False,
-        "error":      None,
-        "logs":       [],
+        "diarized":        False,
+        "audio_available": False,
+        "test_mode":       False,
+        "error":           None,
+        "logs":            [],
     }
 
 
@@ -370,6 +373,35 @@ def _route_and_transcribe(
 
 
 # ---------------------------------------------------------------------------
+# Audio persistant pour téléchargement
+# ---------------------------------------------------------------------------
+
+def _trim_wav(wav_path: str, duration_secs: int) -> None:
+    """Tronque le WAV en place à duration_secs secondes."""
+    tmp = wav_path + ".trim.wav"
+    subprocess.run(
+        [FFMPEG_BIN, "-y", "-i", wav_path, "-t", str(duration_secs), tmp],
+        capture_output=True, check=True,
+    )
+    os.replace(tmp, wav_path)
+
+
+def _save_job_audio(job_id: str, wav_path: str) -> None:
+    """Re-encode le WAV traité en MP3 128k et le conserve pour téléchargement."""
+    mp3_path = os.path.join(tempfile.gettempdir(), f"lexia_{job_id}.mp3")
+    try:
+        subprocess.run(
+            [FFMPEG_BIN, "-y", "-i", wav_path, "-b:a", "128k", mp3_path],
+            capture_output=True, check=True,
+        )
+        _audio_files[job_id] = mp3_path
+        jobs[job_id]["audio_available"] = True
+        log(job_id, "Audio MP3 disponible pour téléchargement.", "info")
+    except subprocess.CalledProcessError as e:
+        log(job_id, f"Encodage MP3 échoué (téléchargement indisponible) : {e.stderr.decode()}", "error")
+
+
+# ---------------------------------------------------------------------------
 # Runners (threads)
 # ---------------------------------------------------------------------------
 
@@ -380,6 +412,7 @@ def run_transcription_from_file(
     language: str,
     preprocess: bool = True,
     diarize: bool = False,
+    test_mode: bool = False,
 ) -> None:
     log(job_id, "Démarrage du job depuis un fichier local", "step")
     log(job_id, f"Fichier : {os.path.basename(file_path)}", "info")
@@ -399,8 +432,15 @@ def run_transcription_from_file(
                 return
             log(job_id, f"WAV généré : {os.path.getsize(wav_path)/1024/1024:.1f} Mo @ {SAMPLE_RATE}Hz mono", "success")
 
+            if test_mode:
+                _trim_wav(wav_path, 15)
+                log(job_id, "Mode test : audio tronqué à 15 secondes.", "step")
+                jobs[job_id]["test_mode"] = True
+
             if preprocess:
                 preprocess_audio(wav_path, job_id)
+
+            _save_job_audio(job_id, wav_path)
 
             jobs[job_id]["status"] = "transcribing"
             transcript, detected_lang, model_used = _route_and_transcribe(
@@ -420,6 +460,7 @@ def run_transcription(
     language: str,
     preprocess: bool = True,
     diarize: bool = False,
+    test_mode: bool = False,
 ) -> None:
     jobs[job_id]["status"] = "downloading"
     log(job_id, "Démarrage du job de transcription", "step")
@@ -466,8 +507,15 @@ def run_transcription(
                 return
             log(job_id, f"WAV généré : {os.path.getsize(wav_path)/1024/1024:.1f} Mo @ {SAMPLE_RATE}Hz mono", "success")
 
+            if test_mode:
+                _trim_wav(wav_path, 15)
+                log(job_id, "Mode test : audio tronqué à 15 secondes.", "step")
+                jobs[job_id]["test_mode"] = True
+
             if preprocess:
                 preprocess_audio(wav_path, job_id)
+
+            _save_job_audio(job_id, wav_path)
 
             jobs[job_id]["status"] = "transcribing"
             transcript, detected_lang, model_used = _route_and_transcribe(
@@ -500,6 +548,7 @@ def transcribe():
     language   = data.get("language", "auto").strip()
     preprocess = bool(data.get("preprocess", True))
     diarize    = bool(data.get("diarize", False))
+    test_mode  = bool(data.get("test_mode", False))
 
     if not url:
         return jsonify({"error": "URL manquante"}), 400
@@ -510,7 +559,7 @@ def transcribe():
     jobs[job_id] = _new_job()
     threading.Thread(
         target=run_transcription,
-        args=(job_id, url, language, preprocess, diarize),
+        args=(job_id, url, language, preprocess, diarize, test_mode),
         daemon=True,
     ).start()
     return jsonify({"job_id": job_id})
@@ -532,6 +581,25 @@ def get_logs(job_id):
     return jsonify({"logs": job["logs"]})
 
 
+@app.route("/test-diarize")
+def test_diarize():
+    try:
+        _get_diarization_pipeline()
+        return jsonify({"ok": True, "message": "Pipeline pyannote chargé — connexion et token valides."})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/download-audio/<job_id>")
+def download_audio(job_id):
+    path = _audio_files.get(job_id)
+    if not path or not os.path.isfile(path):
+        return jsonify({"error": "Fichier audio non disponible"}), 404
+    title = (jobs.get(job_id) or {}).get("title") or "audio"
+    safe  = "".join(c if c.isalnum() or c in "- _" else "_" for c in title)
+    return send_file(path, as_attachment=True, download_name=f"{safe}.mp3", mimetype="audio/mpeg")
+
+
 @app.route("/transcribe-file", methods=["POST"])
 def transcribe_file():
     if "file" not in request.files:
@@ -541,6 +609,7 @@ def transcribe_file():
     language   = request.form.get("language", "auto").strip()
     preprocess = request.form.get("preprocess", "true").lower() == "true"
     diarize    = request.form.get("diarize", "false").lower() == "true"
+    test_mode  = request.form.get("test_mode", "false").lower() == "true"
 
     if not f.filename:
         return jsonify({"error": "Nom de fichier invalide"}), 400
@@ -557,7 +626,7 @@ def transcribe_file():
     jobs[job_id] = _new_job(title)
     threading.Thread(
         target=run_transcription_from_file,
-        args=(job_id, safe_path, upload_dir, language, preprocess, diarize),
+        args=(job_id, safe_path, upload_dir, language, preprocess, diarize, test_mode),
         daemon=True,
     ).start()
     return jsonify({"job_id": job_id})
