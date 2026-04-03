@@ -3,4 +3,8 @@ faster-whisper>=1.0.0
 yt-dlp
 soundfile
 numpy
+scipy>=1.11.0
+noisereduce>=3.0.0
+pyannote.audio==3.3.2
+python-dotenv>=1.0.0
 # PyTorch cu128 et NeMo installes separement via install.bat

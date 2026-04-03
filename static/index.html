@@ -184,6 +184,17 @@
     .btn-action.copied { border-color: var(--success); color: var(--success); }
     textarea#transcript-output { width: 100%; min-height: 320px; height: auto; resize: none; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px; font-family: var(--font-mono); font-size: 13px; font-weight: 300; color: var(--text); line-height: 1.7; resize: vertical; outline: none; }
 
+    .option-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 8px; }
+    .option-label { font-family: var(--font-mono); font-size: 11px; }
+    .option-title { color: var(--text); text-transform: uppercase; letter-spacing: 0.15em; }
+    .option-hint  { color: var(--muted); margin-top: 3px; }
+    .pill-toggle  { position: relative; display: inline-block; width: 40px; height: 22px; cursor: pointer; flex-shrink: 0; }
+    .pill-toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .pill-track   { position: absolute; inset: 0; border-radius: 11px; background: var(--border); transition: background 0.2s, border-color 0.2s; border: 1px solid var(--border); }
+    .pill-toggle input:checked + .pill-track { background: var(--accent); border-color: var(--accent); }
+    .pill-thumb   { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: var(--muted); transition: transform 0.2s, background 0.2s; pointer-events: none; }
+    .pill-toggle input:checked ~ .pill-thumb { transform: translateX(18px); background: #0c0c0e; }
+
     @keyframes fadeDown { from { opacity:0; transform:translateY(-16px); } to { opacity:1; transform:translateY(0); } }
     @keyframes fadeUp   { from { opacity:0; transform:translateY(16px);  } to { opacity:1; transform:translateY(0); } }
     @keyframes spin     { to { transform: rotate(360deg); } }
@@ -263,6 +274,28 @@
           → <span class="hl-canary">Canary-Qwen-2.5B</span> si anglais détecté,
           sinon <span class="hl-whisper">Whisper large-v3</span>
         </div>
+        <div class="option-row">
+          <div class="option-label">
+            <div class="option-title">Prétraitement audio</div>
+            <div class="option-hint">filtre HP · débruitage spectral · normalisation RMS</div>
+          </div>
+          <label class="pill-toggle" title="Activer le prétraitement DSP avant transcription">
+            <input type="checkbox" id="toggle-preprocess" checked />
+            <span class="pill-track"></span>
+            <span class="pill-thumb"></span>
+          </label>
+        </div>
+        <div class="option-row">
+          <div class="option-label">
+            <div class="option-title">Diarisation</div>
+            <div class="option-hint">identification des locuteurs · nécessite HF_TOKEN</div>
+          </div>
+          <label class="pill-toggle" title="Identifier qui parle et quand (pyannote · HF_TOKEN requis)">
+            <input type="checkbox" id="toggle-diarize" />
+            <span class="pill-track"></span>
+            <span class="pill-thumb"></span>
+          </label>
+        </div>
       </div>
 
       <div class="status-bar" id="status-bar">
@@ -280,6 +313,7 @@
           <div class="result-tags">
             <span class="result-tag lang" id="result-lang"></span>
             <span class="result-tag" id="result-model"></span>
+            <span class="result-tag model-canary" id="result-diarized" style="display:none">Diarisation</span>
           </div>
         </div>
         <div class="actions">
@@ -463,7 +497,7 @@
       try {
         const data = await fetch('/transcribe', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, language: langSelect.value }),
+          body: JSON.stringify({ url, language: langSelect.value, preprocess: document.getElementById('toggle-preprocess').checked, diarize: document.getElementById('toggle-diarize').checked }),
         }).then(r => r.json());
         if (data.error) throw new Error(data.error);
         startPolling(data.job_id);
@@ -486,6 +520,8 @@
       const formData = new FormData();
       formData.append('file', selectedFile);
       formData.append('language', langSelect.value);
+      formData.append('preprocess', document.getElementById('toggle-preprocess').checked ? 'true' : 'false');
+      formData.append('diarize', document.getElementById('toggle-diarize').checked ? 'true' : 'false');
 
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/transcribe-file');
@@ -525,6 +561,7 @@
       const isCanary = (job.model_used || '').includes('Canary');
       resultModel.textContent = job.model_used || '';
       resultModel.className = 'result-tag ' + (isCanary ? 'model-canary' : 'model-whisper');
+      document.getElementById('result-diarized').style.display = job.diarized ? '' : 'none';
       transcriptEl.value = job.transcript || '';
 
       resultCard.classList.add('visible');
