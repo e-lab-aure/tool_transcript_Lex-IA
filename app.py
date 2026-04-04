@@ -76,8 +76,9 @@ SUPPORTED_LANGUAGES = {
 # ---------------------------------------------------------------------------
 # Store des jobs
 # ---------------------------------------------------------------------------
-jobs: dict        = {}
-_audio_files: dict = {}  # job_id -> chemin MP3 persistant
+jobs: dict          = {}
+_audio_files: dict  = {}  # job_id -> chemin MP3 persistant
+_speaker_clips: dict = {}  # job_id -> {speaker_id: chemin MP3 extrait}
 
 
 def _new_job(title: str | None = None) -> dict:
@@ -89,7 +90,10 @@ def _new_job(title: str | None = None) -> dict:
         "model_used": None,
         "diarized":        False,
         "audio_available": False,
-        "test_mode":       False,
+        "test_mode":       0,
+        "speakers":        [],
+        "segments":        [],
+        "duration_secs":   None,
         "error":           None,
         "logs":            [],
     }
@@ -231,7 +235,15 @@ def _get_diarization_pipeline():
         )
 
     huggingface_hub.login(token=hf_token, add_to_git_credential=False)
-    _diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+
+    # PyTorch >= 2.6 : weights_only=True par défaut bloque les classes pyannote.
+    # On force weights_only=False uniquement pendant ce chargement (source HF officielle).
+    _orig_load = torch.load
+    torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "weights_only": False})
+    try:
+        _diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+    finally:
+        torch.load = _orig_load
     if torch.cuda.is_available():
         _diarization_pipeline = _diarization_pipeline.to(torch.device("cuda"))
     return _diarization_pipeline
@@ -275,6 +287,103 @@ def assign_speakers(whisper_segments: list, diar_segments: list) -> str:
         em, es = int(seg.end // 60), seg.end % 60
         lines.append(f"[{name} | {sm:02d}:{ss:05.2f} -> {em:02d}:{es:05.2f}] {seg.text.strip()}")
     return "\n".join(lines)
+
+
+def _build_speaker_meta(whisper_segments: list, diar_segments: list) -> list[dict]:
+    """
+    Construit les metadonnees par locuteur pour la modale de renommage.
+    Retourne [{id, label, clip_start, clip_end, excerpt}, ...] dans l'ordre d'apparition.
+    """
+    seen: list = []
+    for d in diar_segments:
+        if d["speaker"] not in seen:
+            seen.append(d["speaker"])
+
+    meta = []
+    for i, speaker_id in enumerate(seen):
+        label = f"Locuteur {i + 1}"
+        speaker_diar = [d for d in diar_segments if d["speaker"] == speaker_id]
+        if not speaker_diar:
+            continue
+
+        # Premier segment de ce locuteur — clip de 8s maximum
+        first = speaker_diar[0]
+        clip_start = first["start"]
+        clip_end   = min(first["end"], clip_start + 8.0)
+
+        # Premier segment Whisper qui chevauche la region du clip
+        excerpt = ""
+        for seg in whisper_segments:
+            if max(seg.start, clip_start - 1.0) < min(seg.end, clip_end + 5.0):
+                excerpt = seg.text.strip()
+                break
+
+        meta.append({
+            "id":         speaker_id,
+            "label":      label,
+            "clip_start": clip_start,
+            "clip_end":   clip_end,
+            "excerpt":    excerpt,
+        })
+    return meta
+
+
+def _build_segments(whisper_segs: list, diar_segments: list | None = None) -> list[dict]:
+    """
+    Construit [{start, end, text, speaker}] a partir des segments Whisper.
+    Si diar_segments fourni, ajoute le locuteur par max-overlap.
+    """
+    names: dict = {}
+    if diar_segments:
+        seen: list = []
+        for d in diar_segments:
+            if d["speaker"] not in seen:
+                seen.append(d["speaker"])
+        names = {sp: f"Locuteur {i + 1}" for i, sp in enumerate(seen)}
+
+    result = []
+    for seg in whisper_segs:
+        speaker = None
+        if diar_segments:
+            best, best_ov = None, 0.0
+            for d in diar_segments:
+                ov = max(0.0, min(seg.end, d["end"]) - max(seg.start, d["start"]))
+                if ov > best_ov:
+                    best_ov, best = ov, d["speaker"]
+            speaker = names.get(best, "Inconnu") if best else "Inconnu"
+        result.append({
+            "start":   round(seg.start, 3),
+            "end":     round(seg.end,   3),
+            "text":    seg.text.strip(),
+            "speaker": speaker,
+        })
+    return result
+
+
+def _save_speaker_clips(job_id: str, speaker_meta: list, wav_path: str) -> None:
+    """Extrait un court extrait MP3 par locuteur depuis wav_path."""
+    clips: dict = {}
+    for speaker in speaker_meta:
+        duration = speaker["clip_end"] - speaker["clip_start"]
+        if duration <= 0:
+            continue
+        mp3_path = os.path.join(
+            tempfile.gettempdir(),
+            f"lexia_{job_id}_spk_{speaker['id']}.mp3",
+        )
+        try:
+            subprocess.run(
+                [FFMPEG_BIN, "-y",
+                 "-ss", str(speaker["clip_start"]),
+                 "-t",  str(duration),
+                 "-i",  wav_path,
+                 "-b:a", "64k", mp3_path],
+                capture_output=True, check=True,
+            )
+            clips[speaker["id"]] = mp3_path
+        except subprocess.CalledProcessError:
+            pass
+    _speaker_clips[job_id] = clips
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +455,12 @@ def _route_and_transcribe(
         transcript, detected_lang, segments = transcribe_with_whisper(
             wav_path, lang_param, job_id, return_segments=True
         )
-        transcript = assign_speakers(segments, diarize_audio(wav_path, job_id))
+        diar_segments = diarize_audio(wav_path, job_id)
+        transcript = assign_speakers(segments, diar_segments)
+        speaker_meta = _build_speaker_meta(segments, diar_segments)
+        jobs[job_id]["speakers"]  = speaker_meta
+        jobs[job_id]["segments"]  = _build_segments(segments, diar_segments)
+        _save_speaker_clips(job_id, speaker_meta, wav_path)
         jobs[job_id]["diarized"] = True
         return transcript, detected_lang, "Whisper large-v3 + Diarisation"
 
@@ -364,11 +478,13 @@ def _route_and_transcribe(
             log(job_id, "Anglais détecté → Canary-Qwen-2.5B", "step")
             return transcribe_with_canary(wav_path, tmpdir, job_id), "en", "Canary-Qwen-2.5B (anglais détecté)"
         log(job_id, f"Langue non-anglaise ({detected_lang}) → Whisper large-v3", "step")
-        transcript, detected_lang = transcribe_with_whisper(wav_path, None, job_id)
+        transcript, detected_lang, segs = transcribe_with_whisper(wav_path, None, job_id, return_segments=True)
+        jobs[job_id]["segments"] = _build_segments(segs)
         return transcript, detected_lang, f"Whisper large-v3 ({detected_lang} détecté)"
 
     log(job_id, f"Langue explicite ({language}) → Whisper large-v3", "step")
-    transcript, detected_lang = transcribe_with_whisper(wav_path, language, job_id)
+    transcript, detected_lang, segs = transcribe_with_whisper(wav_path, language, job_id, return_segments=True)
+    jobs[job_id]["segments"] = _build_segments(segs)
     return transcript, detected_lang, "Whisper large-v3"
 
 
@@ -412,7 +528,7 @@ def run_transcription_from_file(
     language: str,
     preprocess: bool = True,
     diarize: bool = False,
-    test_mode: bool = False,
+    test_mode: int = 0,
 ) -> None:
     log(job_id, "Démarrage du job depuis un fichier local", "step")
     log(job_id, f"Fichier : {os.path.basename(file_path)}", "info")
@@ -433,12 +549,18 @@ def run_transcription_from_file(
             log(job_id, f"WAV généré : {os.path.getsize(wav_path)/1024/1024:.1f} Mo @ {SAMPLE_RATE}Hz mono", "success")
 
             if test_mode:
-                _trim_wav(wav_path, 15)
-                log(job_id, "Mode test : audio tronqué à 15 secondes.", "step")
-                jobs[job_id]["test_mode"] = True
+                _trim_wav(wav_path, test_mode)
+                log(job_id, f"Mode test : audio tronqué à {test_mode} secondes.", "step")
+                jobs[job_id]["test_mode"] = test_mode
 
             if preprocess:
                 preprocess_audio(wav_path, job_id)
+
+            try:
+                _info = sf.info(wav_path)
+                jobs[job_id]["duration_secs"] = round(_info.frames / _info.samplerate, 1)
+            except Exception:
+                pass
 
             _save_job_audio(job_id, wav_path)
 
@@ -460,7 +582,7 @@ def run_transcription(
     language: str,
     preprocess: bool = True,
     diarize: bool = False,
-    test_mode: bool = False,
+    test_mode: int = 0,
 ) -> None:
     jobs[job_id]["status"] = "downloading"
     log(job_id, "Démarrage du job de transcription", "step")
@@ -508,12 +630,18 @@ def run_transcription(
             log(job_id, f"WAV généré : {os.path.getsize(wav_path)/1024/1024:.1f} Mo @ {SAMPLE_RATE}Hz mono", "success")
 
             if test_mode:
-                _trim_wav(wav_path, 15)
-                log(job_id, "Mode test : audio tronqué à 15 secondes.", "step")
-                jobs[job_id]["test_mode"] = True
+                _trim_wav(wav_path, test_mode)
+                log(job_id, f"Mode test : audio tronqué à {test_mode} secondes.", "step")
+                jobs[job_id]["test_mode"] = test_mode
 
             if preprocess:
                 preprocess_audio(wav_path, job_id)
+
+            try:
+                _info = sf.info(wav_path)
+                jobs[job_id]["duration_secs"] = round(_info.frames / _info.samplerate, 1)
+            except Exception:
+                pass
 
             _save_job_audio(job_id, wav_path)
 
@@ -548,7 +676,7 @@ def transcribe():
     language   = data.get("language", "auto").strip()
     preprocess = bool(data.get("preprocess", True))
     diarize    = bool(data.get("diarize", False))
-    test_mode  = bool(data.get("test_mode", False))
+    test_mode  = int(data.get("test_mode", 0))
 
     if not url:
         return jsonify({"error": "URL manquante"}), 400
@@ -609,7 +737,7 @@ def transcribe_file():
     language   = request.form.get("language", "auto").strip()
     preprocess = request.form.get("preprocess", "true").lower() == "true"
     diarize    = request.form.get("diarize", "false").lower() == "true"
-    test_mode  = request.form.get("test_mode", "false").lower() == "true"
+    test_mode  = int(request.form.get("test_mode", "0") or "0")
 
     if not f.filename:
         return jsonify({"error": "Nom de fichier invalide"}), 400
@@ -630,6 +758,15 @@ def transcribe_file():
         daemon=True,
     ).start()
     return jsonify({"job_id": job_id})
+
+
+@app.route("/speaker-audio/<job_id>/<speaker_id>")
+def speaker_audio(job_id, speaker_id):
+    clips = _speaker_clips.get(job_id, {})
+    path  = clips.get(speaker_id)
+    if not path or not os.path.isfile(path):
+        return jsonify({"error": "Extrait audio non disponible"}), 404
+    return send_file(path, mimetype="audio/mpeg")
 
 
 if __name__ == "__main__":
