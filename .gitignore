@@ -6,3 +6,5 @@ __pycache__/
 *.tmp
 1.0.0
 .claude/
+logs/
+tray_config.json

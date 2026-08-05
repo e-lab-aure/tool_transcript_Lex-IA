@@ -21,10 +21,36 @@ install.bat
 ```
 
 ## Lancement
+
+### Icône de zone de notification (recommandé)
+```bat
+tray.bat
+```
+Une icône apparaît près de l'horloge et pilote le serveur sans console.
+
+Menu (clic droit) :
+- **Ouvrir l'interface** — http://localhost:5000 (double-clic sur l'icône)
+- **Démarrer** / **Suspendre** / **Reprendre** / **Redémarrer** / **Arrêter**
+- **Ouvrir le journal** — sortie du serveur dans `logs/server.log`
+- **Démarrer avec Windows** — crée le raccourci de démarrage de session
+- **Démarrer le serveur automatiquement** — lance le serveur avec l'icône
+
+Couleur de l'icône : gris = arrêté, bleu = démarrage, vert = prêt, orange = suspendu, rouge = erreur.
+
+Le serveur ne répond qu'après le chargement des deux modèles, ce qui prend une à
+deux minutes. **Suspendre** gèle le processus mais garde la VRAM allouée ; seul
+**Arrêter** décharge les modèles du GPU.
+
+### Console
 ```bat
 run.bat
 ```
-Ouvre http://localhost:5000
+
+## Démarrage automatique de Windows
+
+Coche **Démarrer avec Windows** dans le menu de l'icône. Un raccourci est créé
+dans le dossier de démarrage de la session, sans droits administrateur. Décoche
+pour le retirer.
 
 ## Mise à jour yt-dlp
 ```bat

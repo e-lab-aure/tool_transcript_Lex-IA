@@ -32,9 +32,10 @@ app = Flask(__name__, static_folder="static")
 # ---------------------------------------------------------------------------
 # Binaires
 # ---------------------------------------------------------------------------
-_SCRIPTS  = os.path.dirname(sys.executable)
+_SCRIPTS   = os.path.dirname(sys.executable)
 _YTDLP_EXE = os.path.join(_SCRIPTS, "yt-dlp.exe")
-YTDLP_BIN = _YTDLP_EXE if os.path.isfile(_YTDLP_EXE) else "yt-dlp"
+# Utilise le module pip du venv (cohérent avec pip install --upgrade yt-dlp)
+YTDLP_BIN  = [sys.executable, "-m", "yt_dlp"]
 FFMPEG_BIN = "ffmpeg"
 
 # ---------------------------------------------------------------------------
@@ -593,16 +594,17 @@ def run_transcription(
         with tempfile.TemporaryDirectory() as tmpdir:
             log(job_id, "Récupération du titre de la vidéo via yt-dlp...", "step")
             title_result = subprocess.run(
-                [YTDLP_BIN, "--no-playlist", "--print", "title", url],
+                YTDLP_BIN + ["--no-playlist", "--print", "title", url],
                 capture_output=True, text=True,
             )
+            
             title = title_result.stdout.strip().split("\n")[0] or "transcript"
             jobs[job_id]["title"] = title
             log(job_id, f"Titre : « {title} »", "info")
 
             log(job_id, "Téléchargement de la piste audio (yt-dlp → mp3)...", "step")
             dl = subprocess.run(
-                [YTDLP_BIN, "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                YTDLP_BIN + ["-x", "--audio-format", "mp3", "--audio-quality", "0",
                  "-o", os.path.join(tmpdir, "audio.%(ext)s"), "--no-playlist", url],
                 capture_output=True, text=True,
             )
@@ -662,6 +664,14 @@ def run_transcription(
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
+
+
+@app.route("/health")
+def health():
+    """Sonde utilisee par le lanceur : le serveur ne repond qu'apres le chargement
+    des modeles, et signale les transcriptions en cours avant un arret."""
+    active = sum(1 for job in jobs.values() if job["status"] not in ("done", "error"))
+    return jsonify({"status": "ok", "active_jobs": active})
 
 
 @app.route("/languages")
@@ -769,5 +779,62 @@ def speaker_audio(job_id, speaker_id):
     return send_file(path, mimetype="audio/mpeg")
 
 
+@app.route("/api/transcribe-live", methods=["POST", "OPTIONS"])
+def transcribe_live():
+    # Pre-flight CORS
+    if request.method == "OPTIONS":
+        resp = app.make_default_options_response()
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp
+
+    if "audio" not in request.files:
+        return jsonify({"error": "Champ 'audio' manquant"}), 400
+
+    f          = request.files["audio"]
+    language   = request.form.get("language", "auto").strip()
+    preprocess = request.form.get("preprocess", "false").lower() == "true"
+
+    if language not in SUPPORTED_LANGUAGES:
+        return jsonify({"error": f"Langue non supportee : {language}"}), 400
+
+    tmpdir = tempfile.mkdtemp(prefix="live_")
+    try:
+        ext      = os.path.splitext(f.filename or "audio.webm")[1].lower() or ".webm"
+        src_path = os.path.join(tmpdir, f"input{ext}")
+        wav_path = os.path.join(tmpdir, "audio.wav")
+        f.save(src_path)
+
+        try:
+            convert_to_wav(src_path, wav_path)
+        except subprocess.CalledProcessError:
+            return jsonify({"error": "Format audio non reconnu par ffmpeg"}), 422
+
+        audio_data, sr = sf.read(wav_path, dtype="float32")
+        duration_secs  = len(audio_data) / sr
+
+        if preprocess:
+            preprocess_audio(wav_path)
+
+        lang_param = None if language == "auto" else language
+        transcript, detected_lang = transcribe_with_whisper(wav_path, lang_param)
+
+        resp = jsonify({
+            "transcript":   transcript,
+            "language":     detected_lang,
+            "duration_secs": round(duration_secs, 2),
+        })
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+
+    except Exception as e:
+        print(f"[live] Erreur : {e}")
+        return jsonify({"error": "Erreur interne lors de la transcription"}), 500
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    app.run(debug=False, port=5000, threaded=True)
+    app.run(host="0.0.0.0", debug=False, port=5000, threaded=True)

@@ -28,7 +28,7 @@ echo [2/5] Mise a jour de pip...
 .venv\Scripts\python.exe -m pip install --upgrade pip --quiet
 
 echo [3/5] Installation de PyTorch 2.8 cu128...
-.venv\Scripts\pip.exe install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+.venv\Scripts\python.exe -m pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 if errorlevel 1 (
     echo [ERREUR] Installation de PyTorch echouee.
     pause
@@ -36,7 +36,7 @@ if errorlevel 1 (
 )
 
 echo [4/5] Installation des dependances de base...
-.venv\Scripts\pip.exe install flask>=3.0.0 faster-whisper>=1.0.0 yt-dlp
+.venv\Scripts\python.exe -m pip install flask>=3.0.0 faster-whisper>=1.0.0 yt-dlp pystray>=0.19.5 pillow>=10.0.0 psutil>=5.9.0
 if errorlevel 1 (
     echo [ERREUR] Installation des dependances echouee.
     pause
@@ -45,7 +45,7 @@ if errorlevel 1 (
 
 echo [5/5] Installation de NeMo trunk (Canary-Qwen-2.5B)...
 echo      ^(peut prendre 10-15 min, ~5 Go^)
-.venv\Scripts\pip.exe install "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git"
+.venv\Scripts\python.exe -m pip install "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git"
 if errorlevel 1 (
     echo [ERREUR] Installation de NeMo echouee.
     echo Verifie que git est installe et dans ton PATH.
@@ -54,7 +54,7 @@ if errorlevel 1 (
 )
 
 echo [5b/5] Fix compatibilite peft / Canary-Qwen-2.5B ^(Qwen3Model^)...
-.venv\Scripts\pip.exe install "peft==0.12.0"
+.venv\Scripts\python.exe -m pip install "peft==0.12.0"
 if errorlevel 1 (
     echo [ERREUR] Fix peft echoue.
     pause
