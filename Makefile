@@ -18,7 +18,7 @@ run:
 
 update:
 	@echo "→ Mise à jour de yt-dlp..."
-	$(PIP) install --upgrade yt-dlp
+	$(PIP) install --upgrade "yt-dlp[default,deno]"
 	@echo "✅ yt-dlp mis à jour."
 
 clean:

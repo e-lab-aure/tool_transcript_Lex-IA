@@ -1,6 +1,6 @@
 flask>=3.0.0
 faster-whisper>=1.0.0
-yt-dlp
+yt-dlp[default,deno]
 soundfile
 numpy
 scipy>=1.11.0

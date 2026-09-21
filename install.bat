@@ -36,7 +36,7 @@ if errorlevel 1 (
 )
 
 echo [4/5] Installation des dependances de base...
-.venv\Scripts\python.exe -m pip install flask>=3.0.0 faster-whisper>=1.0.0 yt-dlp pystray>=0.19.5 pillow>=10.0.0 psutil>=5.9.0
+.venv\Scripts\python.exe -m pip install flask>=3.0.0 faster-whisper>=1.0.0 "yt-dlp[default,deno]" pystray>=0.19.5 pillow>=10.0.0 psutil>=5.9.0
 if errorlevel 1 (
     echo [ERREUR] Installation des dependances echouee.
     pause

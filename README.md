@@ -5,7 +5,7 @@ Transcripteur audio/vidéo local propulsé par GPU NVIDIA.
 ## Stack
 - **Canary-Qwen-2.5B** (NeMo) — anglais, chunking 40s
 - **Whisper large-v3** (faster-whisper) — toutes les autres langues
-- **yt-dlp** — extraction audio YouTube
+- **yt-dlp** + **deno** — extraction audio/vidéo (deno résout les challenges JS de YouTube, installé dans le venv)
 - **ffmpeg** — conversion audio
 - **Flask** — serveur web local
 
@@ -53,6 +53,11 @@ dans le dossier de démarrage de la session, sans droits administrateur. Décoch
 pour le retirer.
 
 ## Mise à jour yt-dlp
+yt-dlp (avec deno et yt-dlp-ejs) est mis à jour automatiquement à chaque démarrage du serveur (avant le
+chargement des modèles). En cas d'échec (hors ligne), la version installée est
+conservée. Pour désactiver : `LEXIA_SKIP_YTDLP_UPDATE=1` dans `.env`.
+
+Mise à jour manuelle :
 ```bat
 update.bat
 ```

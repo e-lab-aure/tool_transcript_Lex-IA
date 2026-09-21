@@ -38,6 +38,50 @@ _YTDLP_EXE = os.path.join(_SCRIPTS, "yt-dlp.exe")
 YTDLP_BIN  = [sys.executable, "-m", "yt_dlp"]
 FFMPEG_BIN = "ffmpeg"
 
+YTDLP_UPDATE_TIMEOUT = 180  # secondes
+# Extras officiels : "default" apporte yt-dlp-ejs (resolution des challenges JS
+# YouTube), "deno" installe le runtime JS dans le venv, detecte automatiquement.
+YTDLP_PACKAGE = "yt-dlp[default,deno]"
+
+
+def update_ytdlp() -> None:
+    """
+    Met a jour yt-dlp, yt-dlp-ejs et deno via pip avant le chargement des modeles :
+    les sites changent souvent et une version ancienne echoue (formats manquants, 403).
+    Non bloquant : en cas d'echec (hors ligne...), la version installee est conservee.
+    Desactivable avec LEXIA_SKIP_YTDLP_UPDATE=1 dans .env.
+    """
+    if os.environ.get("LEXIA_SKIP_YTDLP_UPDATE", "").strip() == "1":
+        print("⏭  Mise à jour de yt-dlp ignorée (LEXIA_SKIP_YTDLP_UPDATE=1).")
+        return
+
+    print("⏳ Mise à jour de yt-dlp...")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet",
+             "--disable-pip-version-check", YTDLP_PACKAGE],
+            capture_output=True, text=True, check=True, timeout=YTDLP_UPDATE_TIMEOUT,
+        )
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "").strip().splitlines()
+        print(f"⚠️  Mise à jour de yt-dlp échouée, version actuelle conservée : {detail[-1] if detail else e}")
+    except subprocess.TimeoutExpired:
+        print(f"⚠️  Mise à jour de yt-dlp interrompue après {YTDLP_UPDATE_TIMEOUT}s, version actuelle conservée.")
+
+    try:
+        version = subprocess.run(
+            YTDLP_BIN + ["--version"], capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        print(f"✅ yt-dlp {version or 'version inconnue'}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"⚠️  yt-dlp introuvable après mise à jour : {e}")
+
+    if not shutil.which("deno", path=_SCRIPTS + os.pathsep + os.environ.get("PATH", "")):
+        print("⚠️  deno introuvable : certains formats YouTube seront indisponibles (lancer update.bat).")
+
+
+update_ytdlp()
+
 # ---------------------------------------------------------------------------
 # Modeles
 # ---------------------------------------------------------------------------
@@ -686,12 +730,14 @@ def _purge_stale_video_dirs() -> None:
 def _video_format_args(quality: str) -> list[str]:
     """
     Selection du format : meilleure video + meilleur audio fusionnes en MP4.
-    Le tri -S privilegie la resolution puis les conteneurs MP4/M4A, ce qui evite
-    un re-encodage a la fusion.
+    Le tri -S privilegie la resolution, puis a resolution egale le h264 et les
+    conteneurs MP4/M4A : fichier lisible partout, sans re-encodage a la fusion.
+    Sur YouTube, cette selection requiert deno (sinon seuls des formats degrades
+    et souvent refuses en 403 sont proposes).
     """
     height = VIDEO_QUALITIES[quality]
     res  = f"res:{height}" if height else "res"
-    sort = f"{res},ext:mp4:m4a"
+    sort = f"{res},vcodec:h264,ext:mp4:m4a"
     return ["-f", "bv*+ba/b", "-S", sort, "--merge-output-format", "mp4"]
 
 
