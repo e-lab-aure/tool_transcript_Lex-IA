@@ -193,6 +193,20 @@
     .btn-action.copied { border-color: var(--success); color: var(--success); }
     textarea#transcript-output { width: 100%; min-height: 320px; height: auto; resize: none; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px; font-family: var(--font-mono); font-size: 13px; font-weight: 300; color: var(--text); line-height: 1.7; resize: vertical; outline: none; }
 
+    /* ── Video download tab ── */
+    button#btn-submit-video { background: var(--accent); color: #0c0c0e; border: none; border-radius: 10px; padding: 14px 24px; font-family: var(--font-display); font-size: 14px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: background 0.2s, transform 0.1s; }
+    button#btn-submit-video:hover { background: var(--accent-dim); }
+    button#btn-submit-video:active { transform: scale(0.97); }
+    button#btn-submit-video:disabled { background: var(--border); color: var(--muted); cursor: not-allowed; }
+    .quality-row { display: flex; gap: 12px; align-items: center; margin-top: 12px; margin-bottom: 12px; }
+    .quality-seg { flex: 1; display: flex; gap: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 4px; }
+    .quality-btn { flex: 1; padding: 7px 8px; border: 1px solid transparent; background: transparent; font-family: var(--font-mono); font-size: 12px; color: var(--muted); cursor: pointer; border-radius: 7px; transition: background 0.2s, color 0.2s, border-color 0.2s; }
+    .quality-btn:hover:not(.active) { color: var(--text); }
+    .quality-btn.active { background: rgba(232,255,71,0.08); border-color: rgba(232,255,71,0.35); color: var(--accent); }
+    #video-card { display: none; animation: fadeUp 0.4s ease both; }
+    #video-card.visible { display: block; }
+    #video-card .result-header { margin-bottom: 0; align-items: center; }
+
     .option-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 8px; }
     .option-label { font-family: var(--font-mono); font-size: 11px; }
     .option-title { color: var(--text); text-transform: uppercase; letter-spacing: 0.15em; }
@@ -398,6 +412,7 @@
         <div class="source-tabs">
           <button class="tab-btn active" id="tab-url" onclick="switchTab('url')">🔗 URL YouTube</button>
           <button class="tab-btn" id="tab-file" onclick="switchTab('file')">📁 Fichier local</button>
+          <button class="tab-btn" id="tab-video" onclick="switchTab('video')">⬇ Vidéo</button>
         </div>
 
         <div id="panel-url">
@@ -439,6 +454,26 @@
           </div>
         </div>
 
+        <div id="panel-video" style="display:none;">
+          <div class="input-row">
+            <input type="text" id="video-url-input" placeholder="https://... (YouTube, Vimeo, Dailymotion, X...)" autocomplete="off" spellcheck="false" />
+            <button id="btn-submit-video">Télécharger</button>
+          </div>
+          <div class="quality-row">
+            <span class="lang-label">Qualité</span>
+            <div class="quality-seg" id="quality-seg">
+              <button class="quality-btn active" data-quality="best">Max</button>
+              <button class="quality-btn" data-quality="1080">1080p</button>
+              <button class="quality-btn" data-quality="720">720p</button>
+              <button class="quality-btn" data-quality="480">480p</button>
+            </div>
+          </div>
+          <div class="routing-hint">
+            → vidéo + audio complets via <span class="hl-whisper">yt-dlp</span>, fusionnés en MP4 · aucune transcription
+          </div>
+        </div>
+
+        <div id="transcribe-options" class="input-group">
         <div class="lang-row">
           <span class="lang-label">Langue</span>
           <select id="lang-select">
@@ -499,6 +534,7 @@
             <span class="pill-thumb"></span>
           </label>
         </div>
+        </div>
       </div>
 
       <div class="status-bar" id="status-bar">
@@ -539,6 +575,22 @@
         </div>
       </div>
       <textarea id="transcript-output" readonly></textarea>
+    </div>
+
+    <div class="card" id="video-card">
+      <div class="result-header">
+        <div class="result-meta">
+          <div class="result-title" id="video-title">—</div>
+          <div class="result-tags">
+            <span class="result-tag lang" id="video-ext"></span>
+            <span class="result-tag model-canary" id="video-size"></span>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn-action" id="btn-video-transcribe" title="Transcrire cette vidéo depuis son URL">Transcrire</button>
+          <button class="btn-action" id="btn-video-save">Enregistrer la vidéo</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -625,6 +677,10 @@
     const uploadProgress= document.getElementById('upload-progress');
     const progressFill  = document.getElementById('progress-fill');
     const progressLabel = document.getElementById('progress-label');
+    const btnSubmitVideo = document.getElementById('btn-submit-video');
+    const videoUrlInput  = document.getElementById('video-url-input');
+    const videoCard      = document.getElementById('video-card');
+    const qualityBtns    = document.querySelectorAll('.quality-btn');
 
     let selectedFile = null;
     let pollInterval = null;
@@ -635,10 +691,12 @@
 
     // ---- Tabs ----
     function switchTab(tab) {
-      document.getElementById('tab-url').classList.toggle('active', tab === 'url');
-      document.getElementById('tab-file').classList.toggle('active', tab === 'file');
-      document.getElementById('panel-url').style.display  = tab === 'url'  ? '' : 'none';
-      document.getElementById('panel-file').style.display = tab === 'file' ? '' : 'none';
+      ['url', 'file', 'video'].forEach(t => {
+        document.getElementById('tab-' + t).classList.toggle('active', tab === t);
+        document.getElementById('panel-' + t).style.display = tab === t ? '' : 'none';
+      });
+      // Les options de transcription n'ont pas de sens pour un simple telechargement
+      document.getElementById('transcribe-options').style.display = tab === 'video' ? 'none' : '';
     }
 
     // ---- Routing hint ----
@@ -730,9 +788,14 @@
       uploading: '→ Envoi du fichier...', detecting: '→ Détection de la langue...',
       transcribing: '→ Transcription en cours...', done: '✓ Transcription terminée', error: '✗ Erreur',
     };
-    function setStatus(state, extra = '') {
+    const VIDEO_LABELS = {
+      ...LABELS,
+      downloading: '→ Téléchargement de la vidéo...', merging: '→ Fusion vidéo + audio...',
+      done: '✓ Vidéo prête',
+    };
+    function setStatus(state, extra = '', labels = LABELS) {
       statusBar.classList.add('visible');
-      statusText.textContent = LABELS[state] + (extra ? ' — ' + extra : '');
+      statusText.textContent = labels[state] + (extra ? ' — ' + extra : '');
       const terminal = state === 'done' || state === 'error';
       spinner.style.display = terminal ? 'none' : 'block';
       statusDot.style.display = terminal ? 'block' : 'none';
@@ -748,6 +811,7 @@
       logOutput.innerHTML = '';
       setConsoleDot('active');
       resultCard.classList.remove('visible');
+      videoCard.classList.remove('visible');
       errorMsg.classList.remove('visible');
       const tp = document.getElementById('transc-progress');
       tp.classList.remove('visible');
@@ -757,32 +821,40 @@
       document.getElementById('tp-label').textContent = 'Transcription en cours...';
     }
 
+    function setSubmitsDisabled(disabled) {
+      btnSubmit.disabled = disabled; btnSubmitFile.disabled = disabled; btnSubmitVideo.disabled = disabled;
+      btnTests.forEach(b => b.disabled = disabled);
+    }
+
     function startPolling(jobId) {
       pollInterval = setInterval(async () => {
         try {
           const job = await fetch('/status/' + jobId).then(r => r.json());
-          setStatus(job.status, job.title || '');
+          const isVideo = job.kind === 'video';
+          setStatus(job.status, job.title || '', isVideo ? VIDEO_LABELS : LABELS);
 
-          // Activate progress bar when transcription starts and duration is known
-          if (job.status === 'transcribing' && job.duration_secs && !_tpDuration) {
-            _tpDuration = job.duration_secs;
-            _tpStart    = Date.now();
-            document.getElementById('transc-progress').classList.add('visible');
+          if (isVideo) {
+            if (job.progress) _videoProgressUpdate(job.progress, job.status);
+          } else {
+            // Activate progress bar when transcription starts and duration is known
+            if (job.status === 'transcribing' && job.duration_secs && !_tpDuration) {
+              _tpDuration = job.duration_secs;
+              _tpStart    = Date.now();
+              document.getElementById('transc-progress').classList.add('visible');
+            }
+            // Mark complete at 100% when done
+            if (job.status === 'done' && _tpDuration) _tpUpdate(_tpDuration);
           }
-          // Mark complete at 100% when done
-          if (job.status === 'done' && _tpDuration) _tpUpdate(_tpDuration);
 
           if (job.status === 'done') {
             stopPolling(); await pollLogs(jobId);
             setConsoleDot('done');
-            btnSubmit.disabled = false; btnSubmitFile.disabled = false;
-            btnTests.forEach(b => b.disabled = false);
-            showResult(job, jobId);
+            setSubmitsDisabled(false);
+            if (isVideo) showVideoResult(job, jobId); else showResult(job, jobId);
           } else if (job.status === 'error') {
             stopPolling(); await pollLogs(jobId);
             setConsoleDot('error');
-            btnSubmit.disabled = false; btnSubmitFile.disabled = false;
-            btnTests.forEach(b => b.disabled = false);
+            setSubmitsDisabled(false);
             errorMsg.textContent = job.error || 'Erreur inconnue';
             errorMsg.classList.add('visible');
           }
@@ -790,6 +862,71 @@
       }, 1500);
       logInterval = setInterval(() => pollLogs(jobId), 800);
     }
+
+    // ---- Video download ----
+    function _fmtSpeed(bps) {
+      if (!bps) return '';
+      return bps >= 1048576 ? (bps / 1048576).toFixed(1) + ' Mo/s' : (bps / 1024).toFixed(0) + ' Ko/s';
+    }
+
+    // Reuses the transcription progress bar; percent restarts for each stream (video, then audio)
+    function _videoProgressUpdate(p, status) {
+      document.getElementById('transc-progress').classList.add('visible');
+      const pct = Math.round(p.percent || 0);
+      document.getElementById('tp-fill').style.width = pct + '%';
+      document.getElementById('tp-pct').textContent  = pct + '%';
+      const parts = [_fmtSpeed(p.speed), p.eta ? 'ETA ' + _tpFmt(p.eta) : ''].filter(Boolean);
+      document.getElementById('tp-pos').textContent = status === 'downloading' ? parts.join(' · ') : '';
+      document.getElementById('tp-label').textContent =
+        status === 'merging' ? 'Fusion des flux...'
+        : status === 'done' ? 'Téléchargement terminé'
+        : 'Téléchargement' + (p.stream ? ' - flux ' + p.stream : '');
+    }
+
+    function selectedQuality() {
+      const active = document.querySelector('.quality-btn.active');
+      return active ? active.dataset.quality : 'best';
+    }
+
+    async function startVideoDownload() {
+      const url = videoUrlInput.value.trim();
+      if (!url) { videoUrlInput.focus(); return; }
+      initJob();
+      setSubmitsDisabled(true);
+      setStatus('queued', '', VIDEO_LABELS);
+      try {
+        const data = await fetch('/download-video', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, quality: selectedQuality() }),
+        }).then(r => r.json());
+        if (data.error) throw new Error(data.error);
+        startPolling(data.job_id);
+      } catch (e) {
+        setStatus('error'); setConsoleDot('error');
+        errorMsg.textContent = e.message; errorMsg.classList.add('visible');
+        setSubmitsDisabled(false);
+      }
+    }
+
+    function showVideoResult(job, jobId) {
+      document.getElementById('video-title').textContent = job.title || 'Vidéo';
+      document.getElementById('video-ext').textContent   = (job.video_ext || 'mp4').toUpperCase();
+      document.getElementById('video-size').textContent  = job.file_size_mb != null ? job.file_size_mb + ' Mo' : '';
+      document.getElementById('btn-video-save').onclick = () => { window.location.href = '/download-video-file/' + jobId; };
+      const url = videoUrlInput.value.trim();
+      document.getElementById('btn-video-transcribe').onclick = () => {
+        urlInput.value = url;
+        switchTab('url');
+        urlInput.focus();
+      };
+      videoCard.classList.add('visible');
+      // Start the browser download right away; the button stays available to save it again
+      window.location.href = '/download-video-file/' + jobId;
+    }
+
+    qualityBtns.forEach(b => b.addEventListener('click', () => {
+      qualityBtns.forEach(o => o.classList.toggle('active', o === b));
+    }));
 
     // ---- Submit URL ----
     async function startFromUrl() {
@@ -920,6 +1057,8 @@
     btnSubmitFile.addEventListener('click', () => startFromFile(0));
     btnTests.forEach(b => b.addEventListener('click', () => startFromFile(parseInt(b.dataset.secs, 10))));
     urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') startFromUrl(); });
+    btnSubmitVideo.addEventListener('click', startVideoDownload);
+    videoUrlInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !btnSubmitVideo.disabled) startVideoDownload(); });
 
     // ---- Diarize toggle: show/hide naming option ----
     document.getElementById('toggle-diarize').addEventListener('change', function() {

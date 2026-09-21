@@ -80,10 +80,16 @@ SUPPORTED_LANGUAGES = {
 jobs: dict          = {}
 _audio_files: dict  = {}  # job_id -> chemin MP3 persistant
 _speaker_clips: dict = {}  # job_id -> {speaker_id: chemin MP3 extrait}
+_video_files: dict  = {}  # job_id -> chemin de la video telechargee
+
+# Qualites proposees pour le telechargement video : cle -> hauteur max (None = meilleure)
+VIDEO_QUALITIES = {"best": None, "1080": 1080, "720": 720, "480": 480}
+VIDEO_DIR_PREFIX = "lexia_video_"
 
 
-def _new_job(title: str | None = None) -> dict:
+def _new_job(title: str | None = None, kind: str = "transcription") -> dict:
     return {
+        "kind":       kind,
         "status":     "queued",
         "title":      title,
         "transcript": None,
@@ -658,6 +664,154 @@ def run_transcription(
 
 
 # ---------------------------------------------------------------------------
+# Telechargement video (sans transcription)
+# ---------------------------------------------------------------------------
+
+# Ligne emise par yt-dlp via --progress-template, parsee pour la barre de progression
+_PROGRESS_TAG = "LEXIA_PROGRESS"
+_PROGRESS_TEMPLATE = (
+    f"download:{_PROGRESS_TAG} %(progress.downloaded_bytes)s|%(progress.total_bytes)s"
+    "|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s"
+)
+
+
+def _purge_stale_video_dirs() -> None:
+    """Supprime les videos laissees par une execution precedente du serveur."""
+    tmp_root = tempfile.gettempdir()
+    for name in os.listdir(tmp_root):
+        if name.startswith(VIDEO_DIR_PREFIX):
+            shutil.rmtree(os.path.join(tmp_root, name), ignore_errors=True)
+
+
+def _video_format_args(quality: str) -> list[str]:
+    """
+    Selection du format : meilleure video + meilleur audio fusionnes en MP4.
+    Le tri -S privilegie la resolution puis les conteneurs MP4/M4A, ce qui evite
+    un re-encodage a la fusion.
+    """
+    height = VIDEO_QUALITIES[quality]
+    res  = f"res:{height}" if height else "res"
+    sort = f"{res},ext:mp4:m4a"
+    return ["-f", "bv*+ba/b", "-S", sort, "--merge-output-format", "mp4"]
+
+
+def _parse_progress(line: str) -> dict | None:
+    """Convertit une ligne LEXIA_PROGRESS en {percent, speed, eta} (valeurs NA -> None)."""
+    fields = line.split(_PROGRESS_TAG, 1)[1].strip().split("|")
+    if len(fields) != 5:
+        return None
+
+    def num(value: str) -> float | None:
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    downloaded, total, estimate, speed, eta = (num(v) for v in fields)
+    total = total or estimate
+    if downloaded is None or not total:
+        return None
+    return {
+        "percent": round(min(100.0, downloaded / total * 100), 1),
+        "speed":   speed,
+        "eta":     int(eta) if eta is not None else None,
+    }
+
+
+def run_video_download(job_id: str, url: str, quality: str) -> None:
+    job = jobs[job_id]
+    job["status"] = "downloading"
+    log(job_id, "Démarrage du téléchargement vidéo", "step")
+    log(job_id, f"URL cible : {url}", "info")
+    log(job_id, f"Qualité demandée : {'meilleure disponible' if quality == 'best' else quality + 'p max'}", "info")
+
+    out_dir = tempfile.mkdtemp(prefix=VIDEO_DIR_PREFIX)
+    # Force l'UTF-8 sur la sortie de yt-dlp (titres accentues sous Windows)
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    try:
+        log(job_id, "Récupération du titre de la vidéo via yt-dlp...", "step")
+        title_result = subprocess.run(
+            YTDLP_BIN + ["--no-playlist", "--print", "title", "--", url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+        )
+        if title_result.returncode != 0:
+            _fail_job(job_id, title_result.stderr.strip() or "URL non prise en charge par yt-dlp")
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return
+        job["title"] = title_result.stdout.strip().split("\n")[0] or "video"
+        log(job_id, f"Titre : « {job['title']} »", "info")
+
+        log(job_id, "Téléchargement des flux vidéo et audio...", "step")
+        cmd = YTDLP_BIN + _video_format_args(quality) + [
+            "--no-playlist", "--newline", "--no-colors",
+            "--progress-template", _PROGRESS_TEMPLATE,
+            "-o", os.path.join(out_dir, "video.%(ext)s"),
+            "--", url,
+        ]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", env=env,
+        )
+        errors = []
+        stream = 0
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith(_PROGRESS_TAG):
+                progress = _parse_progress(line)
+                if progress:
+                    job["progress"] = {**progress, "stream": stream}
+            elif line.startswith("[download] Destination:"):
+                # Un flux par destination : video puis audio quand ils sont separes
+                stream += 1
+                log(job_id, f"Flux {stream} : {os.path.basename(line.split(':', 1)[1].strip())}", "model")
+            elif line.startswith("[Merger]"):
+                job["status"] = "merging"
+                log(job_id, "Fusion vidéo + audio en MP4 (ffmpeg)...", "step")
+            elif line.startswith("ERROR:"):
+                errors.append(line)
+                log(job_id, line, "error")
+            elif line.startswith("WARNING:"):
+                log(job_id, line, "info")
+        proc.wait()
+
+        if proc.returncode != 0:
+            _fail_job(job_id, "\n".join(errors) or "Erreur lors du téléchargement")
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return
+
+        # Seul le fichier final subsiste apres la fusion ; on ignore les residus partiels
+        candidates = [
+            os.path.join(out_dir, f) for f in os.listdir(out_dir)
+            if not f.endswith((".part", ".ytdl", ".temp"))
+        ]
+        if not candidates:
+            _fail_job(job_id, "Fichier vidéo introuvable après téléchargement")
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return
+        video_path = max(candidates, key=os.path.getsize)
+
+        _video_files[job_id] = video_path
+        size_mb = os.path.getsize(video_path) / 1024 / 1024
+        job.update({
+            "status":          "done",
+            "video_available": True,
+            "video_ext":       os.path.splitext(video_path)[1].lstrip(".") or "mp4",
+            "file_size_mb":    round(size_mb, 1),
+            "progress":        {"percent": 100.0, "speed": None, "eta": 0, "stream": stream},
+        })
+        log(job_id, f"Vidéo prête : {os.path.basename(video_path)} ({size_mb:.1f} Mo)", "success")
+
+    except Exception as e:
+        _fail_job(job_id, f"Erreur : {e}\n{traceback.format_exc()}")
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+_purge_stale_video_dirs()
+
+
+# ---------------------------------------------------------------------------
 # Routes Flask
 # ---------------------------------------------------------------------------
 
@@ -736,6 +890,42 @@ def download_audio(job_id):
     title = (jobs.get(job_id) or {}).get("title") or "audio"
     safe  = "".join(c if c.isalnum() or c in "- _" else "_" for c in title)
     return send_file(path, as_attachment=True, download_name=f"{safe}.mp3", mimetype="audio/mpeg")
+
+
+@app.route("/download-video", methods=["POST"])
+def download_video():
+    data    = request.get_json(silent=True) or {}
+    url     = str(data.get("url", "")).strip()
+    quality = str(data.get("quality", "best")).strip()
+
+    if not url:
+        return jsonify({"error": "URL manquante"}), 400
+    # Refuse tout ce qui n'est pas une URL web (evite qu'une valeur soit lue comme option yt-dlp)
+    if not url.lower().startswith(("http://", "https://")):
+        return jsonify({"error": "URL invalide : http:// ou https:// attendu"}), 400
+    if quality not in VIDEO_QUALITIES:
+        return jsonify({"error": f"Qualité non supportée : {quality}"}), 400
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = _new_job(kind="video")
+    jobs[job_id].update({"progress": None, "video_available": False})
+    threading.Thread(
+        target=run_video_download,
+        args=(job_id, url, quality),
+        daemon=True,
+    ).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/download-video-file/<job_id>")
+def download_video_file(job_id):
+    path = _video_files.get(job_id)
+    if not path or not os.path.isfile(path):
+        return jsonify({"error": "Fichier vidéo non disponible"}), 404
+    title = (jobs.get(job_id) or {}).get("title") or "video"
+    safe  = "".join(c if c.isalnum() or c in "- _" else "_" for c in title)
+    ext   = os.path.splitext(path)[1] or ".mp4"
+    return send_file(path, as_attachment=True, download_name=f"{safe}{ext}")
 
 
 @app.route("/transcribe-file", methods=["POST"])

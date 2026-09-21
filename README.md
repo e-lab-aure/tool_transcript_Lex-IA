@@ -63,6 +63,7 @@ update.bat
 
 ## Fonctionnalités
 - URL YouTube ou fichier local (drag & drop)
+- Onglet **Vidéo** : téléchargement de la vidéo complète (yt-dlp, MP4, qualité au choix)
 - Détection automatique de la langue
 - Routage intelligent vers le meilleur modèle
 - Console IA en temps réel

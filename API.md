@@ -400,6 +400,64 @@ or on failure:
 
 ---
 
+### 10. `POST /download-video` - Async full video download
+
+Downloads the complete video (video + audio merged into MP4) with yt-dlp. No
+transcription is performed. Progress is exposed through `GET /status/<job_id>`.
+
+#### Request
+
+- **Content-Type:** `application/json`
+
+| Field     | Type   | Required | Default  | Description                                              |
+|-----------|--------|----------|----------|----------------------------------------------------------|
+| `url`     | string | yes      | -        | Any `http(s)://` URL supported by yt-dlp. Playlists are ignored (single video only). |
+| `quality` | string | no       | `"best"` | `"best"`, `"1080"`, `"720"` or `"480"` (maximum height). |
+
+#### Response `200 OK`
+
+```json
+{ "job_id": "abc-123" }
+```
+
+#### Job status specifics
+
+Video jobs have `"kind": "video"` and use the statuses `queued`, `downloading`,
+`merging`, `done` and `error`. Extra fields:
+
+```json
+{
+  "kind":            "video",
+  "progress":        { "percent": 42.0, "speed": 3500000.0, "eta": 75, "stream": 1 },
+  "video_available": true,
+  "video_ext":       "mp4",
+  "file_size_mb":    182.4
+}
+```
+
+`progress.percent` restarts for each stream (`stream` 1 = video, 2 = audio when
+they are downloaded separately). `speed` is in bytes/s, `eta` in seconds.
+
+#### Error Responses
+
+| HTTP Status | `error` value                                  |
+|-------------|------------------------------------------------|
+| `400`       | `"URL manquante"`                              |
+| `400`       | `"URL invalide : http:// ou https:// attendu"` |
+| `400`       | `"Qualité non supportée : <value>"`            |
+
+---
+
+### 11. `GET /download-video-file/<job_id>` - Retrieve the downloaded video
+
+Returns the video file once `video_available: true`. Files are kept in the
+system temp folder until the server restarts.
+
+#### Response `200 OK`
+- Content-Disposition: `attachment; filename="<title>.mp4"`
+
+---
+
 ## Error Format
 
 All error responses follow the same structure:
