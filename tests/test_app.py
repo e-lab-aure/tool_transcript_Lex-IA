@@ -1,4 +1,5 @@
 import io
+import subprocess
 import tempfile
 import threading
 import time
@@ -33,6 +34,27 @@ class AppTests(unittest.TestCase):
             health = self.client.get("/health")
         self.assertEqual(health.json["status"], "ok")
         self.assertIsNone(health.json["ytdlp_version"])
+
+    def test_startup_ytdlp_update_uses_local_python_and_handles_timeout(self):
+        with (patch.dict(app.os.environ, {"LEXIA_SKIP_YTDLP_UPDATE": "0"}),
+              patch.object(app.sys, "base_prefix", "base-python"),
+              patch.object(app.subprocess, "run", side_effect=subprocess.TimeoutExpired("pip", 60)) as run,
+              patch.object(app.app.logger, "warning") as warning):
+            app._update_ytdlp()
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], [app.sys.executable, "-m", "pip", "install"])
+        self.assertIn("--upgrade", command)
+        self.assertIn("yt-dlp[default,deno]", command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 60)
+        warning.assert_called_once()
+        self.assertEqual(self.client.get("/health").json["ytdlp_version"], version("yt-dlp"))
+
+    def test_startup_ytdlp_update_respects_opt_out(self):
+        with (patch.dict(app.os.environ, {"LEXIA_SKIP_YTDLP_UPDATE": "1"}),
+              patch.object(app.subprocess, "run") as run):
+            app._update_ytdlp()
+        run.assert_not_called()
 
     def test_invalid_options_return_json_400(self):
         for payload in ([], {"url": None}, {"url": "https://example.org", "test_mode": "abc"},

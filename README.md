@@ -67,15 +67,17 @@ pour le retirer.
 
 ## Mise à jour yt-dlp
 
-Si un site change et que son téléchargement échoue, arrête LEX-IA puis lance :
+Au démarrage, LEX-IA vérifie si une nouvelle version de yt-dlp est disponible.
+La tentative dure au maximum une minute. Si elle échoue, le serveur continue à démarrer.
+La version utilisée est visible sous **Mode d’emploi → Module YouTube**.
+
+Pour lancer une mise à jour manuelle, arrête LEX-IA puis lance le script suivant.
 ```bat
 update.bat
 ```
 
-Le serveur utilise la version de yt-dlp déjà installée, sans mise à jour au démarrage.
-Consulte **Mode d’emploi → Module YouTube** dans l’application pour voir la version utilisée.
-Relance le serveur après `update.bat`. Une réinstallation réapplique les versions
-verrouillées, y compris celle de yt-dlp.
+Relance le serveur après `update.bat`. Pour conserver les versions verrouillées
+par `install.bat`, définis `LEXIA_SKIP_YTDLP_UPDATE=1` dans `.env`.
 
 ## Architecture
 

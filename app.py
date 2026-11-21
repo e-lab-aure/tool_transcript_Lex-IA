@@ -58,6 +58,35 @@ YTDLP_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8",
              "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
 FFMPEG_BIN = "ffmpeg"
 
+
+def _installed_ytdlp_version() -> str | None:
+    try:
+        return version("yt-dlp")
+    except PackageNotFoundError:
+        return None
+
+
+def _update_ytdlp() -> None:
+    if os.environ.get("LEXIA_SKIP_YTDLP_UPDATE", "").strip() == "1":
+        return
+    if sys.prefix == sys.base_prefix:
+        app.logger.warning("Mise à jour de yt-dlp ignorée hors environnement virtuel.")
+        return
+    print("Vérification de la mise à jour de yt-dlp...")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet",
+             "--disable-pip-version-check", "--no-input", "--only-binary", ":all:",
+             "--upgrade-strategy", "only-if-needed", "--timeout", "5", "--retries", "1",
+             "yt-dlp[default,deno]"],
+            check=True, capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        app.logger.warning("Mise à jour de yt-dlp non terminée (%s). Démarrage maintenu.", type(exc).__name__)
+    installed = _installed_ytdlp_version() or "indisponible"
+    print(f"yt-dlp {installed}")
+
+
 # ---------------------------------------------------------------------------
 # Modeles
 # ---------------------------------------------------------------------------
@@ -968,12 +997,8 @@ def index():
 def health():
     with jobs_lock:
         active = sum(1 for job in jobs.values() if job["status"] not in ("done", "error"))
-    try:
-        ytdlp_version = version("yt-dlp")
-    except PackageNotFoundError:
-        ytdlp_version = None
     return jsonify(status="ok", pid=os.getpid(), active_jobs=active + int(live_slot.locked()),
-                   ytdlp_version=ytdlp_version)
+                   ytdlp_version=_installed_ytdlp_version())
 
 
 @app.route("/languages")
@@ -1186,6 +1211,7 @@ if __name__ == "__main__":
     JOB_ROOT.mkdir(parents=True, exist_ok=True)
     if not shutil.which(FFMPEG_BIN):
         sys.exit("FFmpeg est introuvable dans le PATH.")
+    _update_ytdlp()
     print("Chargement de Whisper large-v3...")
     _whisper_model()
     threading.Thread(target=_cleanup_loop, daemon=True).start()
