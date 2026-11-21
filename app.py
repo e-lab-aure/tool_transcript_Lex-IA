@@ -2,98 +2,80 @@ import functools
 import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
-import traceback
+import time
 import uuid
+import warnings
+from collections import deque
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from queue import Queue
+from urllib.parse import urlsplit
 
 import numpy as np
 import soundfile as sf
-import torch
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify, send_from_directory, send_file
+from werkzeug.exceptions import HTTPException
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+load_dotenv(Path(__file__).with_name(".env"))
 
-# ---------------------------------------------------------------------------
-# GPU
-# ---------------------------------------------------------------------------
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+app = Flask(__name__, static_folder=None)
+STATIC_DIR = Path(__file__).with_name("static")
+app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024
+LIVE_UPLOAD_LIMIT = 16 * 1024 * 1024
+LIVE_MAX_SECONDS = 120
+MAX_AUDIO_SECONDS = 4 * 3600
+MEDIA_TIMEOUT = 300
+DOWNLOAD_TIMEOUT = 1800
 
-app = Flask(__name__, static_folder="static")
+SERVER_PORT = 5000
+
+
+def ensure_port_free(port: int) -> None:
+    """
+    Evite de charger les modeles si un serveur ecoute deja sur le port.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            print(f"❌ Le port {port} est déjà utilisé : un serveur LEX-IA tourne probablement déjà "
+                  "(icône de notification ou autre console). Arrêtez-le avant de relancer.")
+            sys.exit(1)
+
 
 # ---------------------------------------------------------------------------
 # Binaires
 # ---------------------------------------------------------------------------
-_SCRIPTS   = os.path.dirname(sys.executable)
-_YTDLP_EXE = os.path.join(_SCRIPTS, "yt-dlp.exe")
-# Utilise le module pip du venv (cohérent avec pip install --upgrade yt-dlp)
-YTDLP_BIN  = [sys.executable, "-m", "yt_dlp"]
+YTDLP_BIN = [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist",
+             "--socket-timeout", "30", "--retries", "3"]
+YTDLP_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8",
+             "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
 FFMPEG_BIN = "ffmpeg"
-
-YTDLP_UPDATE_TIMEOUT = 180  # secondes
-# Extras officiels : "default" apporte yt-dlp-ejs (resolution des challenges JS
-# YouTube), "deno" installe le runtime JS dans le venv, detecte automatiquement.
-YTDLP_PACKAGE = "yt-dlp[default,deno]"
-
-
-def update_ytdlp() -> None:
-    """
-    Met a jour yt-dlp, yt-dlp-ejs et deno via pip avant le chargement des modeles :
-    les sites changent souvent et une version ancienne echoue (formats manquants, 403).
-    Non bloquant : en cas d'echec (hors ligne...), la version installee est conservee.
-    Desactivable avec LEXIA_SKIP_YTDLP_UPDATE=1 dans .env.
-    """
-    if os.environ.get("LEXIA_SKIP_YTDLP_UPDATE", "").strip() == "1":
-        print("⏭  Mise à jour de yt-dlp ignorée (LEXIA_SKIP_YTDLP_UPDATE=1).")
-        return
-
-    print("⏳ Mise à jour de yt-dlp...")
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet",
-             "--disable-pip-version-check", YTDLP_PACKAGE],
-            capture_output=True, text=True, check=True, timeout=YTDLP_UPDATE_TIMEOUT,
-        )
-    except subprocess.CalledProcessError as e:
-        detail = (e.stderr or e.stdout or "").strip().splitlines()
-        print(f"⚠️  Mise à jour de yt-dlp échouée, version actuelle conservée : {detail[-1] if detail else e}")
-    except subprocess.TimeoutExpired:
-        print(f"⚠️  Mise à jour de yt-dlp interrompue après {YTDLP_UPDATE_TIMEOUT}s, version actuelle conservée.")
-
-    try:
-        version = subprocess.run(
-            YTDLP_BIN + ["--version"], capture_output=True, text=True, timeout=30,
-        ).stdout.strip()
-        print(f"✅ yt-dlp {version or 'version inconnue'}")
-    except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"⚠️  yt-dlp introuvable après mise à jour : {e}")
-
-    if not shutil.which("deno", path=_SCRIPTS + os.pathsep + os.environ.get("PATH", "")):
-        print("⚠️  deno introuvable : certains formats YouTube seront indisponibles (lancer update.bat).")
-
-
-update_ytdlp()
 
 # ---------------------------------------------------------------------------
 # Modeles
 # ---------------------------------------------------------------------------
-print("⏳ Chargement de Whisper large-v3 (faster-whisper)...")
-from faster_whisper import WhisperModel
-whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
-print("✅ Whisper large-v3 pret.")
+gpu_lock = threading.Lock()
 
-print("⏳ Chargement de Canary-Qwen-2.5B (NeMo)...")
-from nemo.collections.speechlm2.models import SALM
-canary_model = SALM.from_pretrained("nvidia/canary-qwen-2.5b").bfloat16().eval().to("cuda")
-print("✅ Canary-Qwen-2.5B pret.")
+
+@functools.cache
+def _whisper_model():
+    from faster_whisper import WhisperModel
+
+    return WhisperModel("large-v3", device="cuda", compute_type="float16")
+
+
+@functools.cache
+def _canary_model():
+    from nemo.collections.speechlm2.models import SALM
+
+    return SALM.from_pretrained("nvidia/canary-qwen-2.5b").bfloat16().eval().to("cuda")
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -125,10 +107,113 @@ jobs: dict          = {}
 _audio_files: dict  = {}  # job_id -> chemin MP3 persistant
 _speaker_clips: dict = {}  # job_id -> {speaker_id: chemin MP3 extrait}
 _video_files: dict  = {}  # job_id -> chemin de la video telechargee
+jobs_lock = threading.Lock()
+finished_at: dict = {}
+JOB_TTL = 24 * 3600
+MAX_LOGS = 256
+JOB_ROOT = Path(tempfile.gettempdir()) / "LEX-IA-jobs"
+transcription_slots = threading.BoundedSemaphore(4)
+video_slots = threading.BoundedSemaphore(2)
+live_slot = threading.Lock()
+transcription_queue = Queue()
+worker_lock = threading.Lock()
+worker_started = False
 
-# Qualites proposees pour le telechargement video : cle -> hauteur max (None = meilleure)
 VIDEO_QUALITIES = {"best": None, "1080": 1080, "720": 720, "480": 480}
-VIDEO_DIR_PREFIX = "lexia_video_"
+
+
+def _job_directory(job_id: str) -> Path:
+    return JOB_ROOT / str(uuid.UUID(job_id))
+
+
+def _remove_job_directory(job_id: str) -> None:
+    try:
+        path = _job_directory(job_id)
+        if path.resolve().parent == JOB_ROOT.resolve():
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        app.logger.warning("Nettoyage impossible pour le job %s", job_id)
+
+
+def _purge_jobs() -> None:
+    now = time.time()
+    with jobs_lock:
+        expired = [job_id for job_id, end in finished_at.items() if now - end >= JOB_TTL]
+        for job_id in expired:
+            for store in (jobs, finished_at, _audio_files, _speaker_clips, _video_files):
+                store.pop(job_id, None)
+        known = set(jobs)
+    for job_id in expired:
+        _remove_job_directory(job_id)
+    # Reprendre aussi les fichiers abandonnes par un arret force.
+    for path in JOB_ROOT.iterdir():
+        if path.name in known:
+            continue
+        try:
+            if str(uuid.UUID(path.name)) == path.name and now - path.stat().st_mtime >= JOB_TTL:
+                _remove_job_directory(path.name)
+        except (ValueError, FileNotFoundError):
+            continue
+
+
+def _cleanup_loop() -> None:
+    while True:
+        try:
+            _purge_jobs()
+        except OSError:
+            app.logger.exception("Impossible de nettoyer les fichiers de travail")
+        time.sleep(300)
+
+
+def _execute_job(job_id, target, args, slots) -> None:
+    try:
+        target(job_id, *args)
+    except subprocess.TimeoutExpired:
+        _fail_job(job_id, "Le téléchargement ou la conversion a dépassé le délai maximal.")
+    except Exception:
+        app.logger.exception("Echec du job %s", job_id)
+        _fail_job(job_id, "Le traitement a échoué. Consultez le journal du serveur.")
+    finally:
+        if jobs[job_id]["status"] == "error":
+            _remove_job_directory(job_id)
+        try:
+            os.utime(_job_directory(job_id))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            app.logger.warning("Horodatage impossible pour le job %s", job_id)
+        with jobs_lock:
+            finished_at[job_id] = time.time()
+        slots.release()
+
+
+def _transcription_worker() -> None:
+    while True:
+        task = transcription_queue.get()
+        _execute_job(*task)
+        transcription_queue.task_done()
+
+
+def _submit_job(job_id, job, target, args, slots) -> None:
+    global worker_started
+    with jobs_lock:
+        jobs[job_id] = job
+    task = (job_id, target, args, slots)
+    try:
+        if slots is transcription_slots:
+            with worker_lock:
+                if not worker_started:
+                    threading.Thread(target=_transcription_worker, daemon=True).start()
+                    worker_started = True
+            transcription_queue.put(task)
+        else:
+            threading.Thread(target=_execute_job, args=task, daemon=True).start()
+    except Exception:
+        with jobs_lock:
+            jobs.pop(job_id, None)
+        raise
 
 
 def _new_job(title: str | None = None, kind: str = "transcription") -> dict:
@@ -140,19 +225,28 @@ def _new_job(title: str | None = None, kind: str = "transcription") -> dict:
         "language":   None,
         "model_used": None,
         "diarized":        False,
+        "diarization_warning": None,
+        "rediarize_available": False,
+        "speaker_options": {},
+        "diarization_turns": [],
         "audio_available": False,
         "test_mode":       0,
         "speakers":        [],
         "segments":        [],
         "duration_secs":   None,
         "error":           None,
-        "logs":            [],
+        "logs":            deque(maxlen=MAX_LOGS),
+        "log_count":       0,
+        "processed_secs":  None,
     }
 
 
 def log(job_id: str, msg: str, level: str = "info") -> None:
     ts = datetime.now().strftime("%H:%M:%S")
-    jobs[job_id]["logs"].append({"ts": ts, "msg": msg, "level": level})
+    with jobs_lock:
+        job = jobs[job_id]
+        job["logs"].append({"ts": ts, "msg": msg, "level": level})
+        job["log_count"] += 1
     print(f"[{ts}] [{level.upper()}] {msg}")
 
 
@@ -177,54 +271,47 @@ def _finish_job(job_id: str, transcript: str, detected_lang: str, model_used: st
 # Helpers audio
 # ---------------------------------------------------------------------------
 
-def convert_to_wav(src_path: str, dst_path: str) -> None:
+def convert_to_wav(src_path: str, dst_path: str, limit: int) -> None:
     subprocess.run(
-        [FFMPEG_BIN, "-y", "-i", src_path, "-ar", str(SAMPLE_RATE), "-ac", "1", dst_path],
+        [FFMPEG_BIN, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+         "-protocol_whitelist", "file,pipe",
+         "-format_whitelist", "wav,mp3,flac,ogg,aac,mov,matroska,webm,avi,asf,mpeg,mpegts,aiff",
+         "-i", src_path, "-map", "0:a:0",
+         "-t", str(limit), "-ar", str(SAMPLE_RATE), "-ac", "1", dst_path],
         capture_output=True,
         check=True,
+        timeout=MEDIA_TIMEOUT,
     )
 
 
 def split_audio(wav_path: str, chunk_secs: int, tmpdir: str) -> tuple[list, float]:
-    audio, sr = sf.read(wav_path, dtype="float32")
-    assert sr == SAMPLE_RATE
-    total_secs    = len(audio) / sr
-    chunk_samples = chunk_secs * sr
-    chunk_paths   = []
-    for i in range(math.ceil(len(audio) / chunk_samples)):
-        start = i * chunk_samples
-        chunk = audio[start : min(start + chunk_samples, len(audio))]
-        path  = os.path.join(tmpdir, f"chunk_{i:04d}.wav")
-        sf.write(path, chunk, sr)
-        chunk_paths.append(path)
+    chunk_paths = []
+    with sf.SoundFile(wav_path) as audio:
+        sr = audio.samplerate
+        if sr != SAMPLE_RATE:
+            raise ValueError("Fréquence audio inattendue")
+        total_secs = len(audio) / sr
+        for i, chunk in enumerate(audio.blocks(blocksize=chunk_secs * sr, dtype="float32")):
+            path = os.path.join(tmpdir, f"chunk_{i:04d}.wav")
+            sf.write(path, chunk, sr)
+            chunk_paths.append(path)
     return chunk_paths, total_secs
 
 
 def preprocess_audio(wav_path: str, job_id: str | None = None) -> None:
     """
-    Chaine DSP en place : filtre HP 80 Hz, passe-bande 100-8 kHz,
-    reduction de bruit spectral, normalisation RMS -20 dBFS, limiteur soft.
+    Chaine DSP en place : passe-bande 100-8 kHz, reduction de bruit,
+    normalisation RMS -20 dBFS et limitation des cretes.
     """
     from scipy.signal import butter, sosfilt
     import noisereduce as nr
 
-    def _soft_limit(x: np.ndarray, threshold: float) -> np.ndarray:
-        gain = np.where(
-            np.abs(x) > threshold,
-            threshold / np.maximum(np.abs(x), 1e-9) * np.tanh(np.abs(x) / threshold),
-            1.0,
-        )
-        return x * gain
-
     if job_id:
-        log(job_id, "Prétraitement audio (filtre HP, débruitage, normalisation)...", "step")
+        log(job_id, "Prétraitement audio (filtre, débruitage, normalisation)...", "step")
 
     audio, sr = sf.read(wav_path, dtype="float32")
     if len(audio) < 2048:
         return
-
-    # Filtre passe-haut 80 Hz — supprime vent / bourdonnement 50-60 Hz
-    audio = sosfilt(butter(4, 80.0, btype="high", fs=sr, output="sos"), audio)
 
     # Passe-bande 100-8000 Hz — shaping doux sur la plage voix
     nyq   = sr / 2.0
@@ -238,8 +325,9 @@ def preprocess_audio(wav_path: str, job_id: str | None = None) -> None:
     if rms > 1e-9:
         audio = audio * (10 ** (-20.0 / 20.0) / rms)
 
-    # Limiteur soft tanh
-    audio = _soft_limit(audio, threshold=0.95)
+    peak = np.max(np.abs(audio))
+    if peak > 0.95:
+        audio *= 0.95 / peak
 
     sf.write(wav_path, audio, sr, subtype="PCM_16")
     if job_id:
@@ -258,157 +346,142 @@ def _get_diarization_pipeline():
     if _diarization_pipeline is not None:
         return _diarization_pipeline
 
-    import huggingface_hub
+    import torch
 
-    # pyannote 3.x appelle hf_hub_download(use_auth_token=...) supprime dans
-    # huggingface_hub >= 1.0 — on traduit use_auth_token -> token une seule fois.
-    if not getattr(huggingface_hub.hf_hub_download, "_compat_patched", False):
-        def _compat(fn):
-            @functools.wraps(fn)
-            def wrapper(*args, **kwargs):
-                if "use_auth_token" in kwargs:
-                    kwargs.setdefault("token", kwargs.pop("use_auth_token"))
-                return fn(*args, **kwargs)
-            wrapper._compat_patched = True
-            return wrapper
-        for _name in ("hf_hub_download", "snapshot_download"):
-            if hasattr(huggingface_hub, _name):
-                setattr(huggingface_hub, _name, _compat(getattr(huggingface_hub, _name)))
-
-    from pyannote.audio import Pipeline
+    # LEX-IA fournit le WAV sous forme de tenseur, sans le decodeur TorchCodec.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r"\s*torchcodec is not installed correctly.*")
+        from pyannote.audio import Pipeline
+        from pyannote.audio.telemetry.metrics import set_telemetry_metrics
 
     hf_token = os.environ.get("HF_TOKEN", "").strip()
     if not hf_token:
-        raise RuntimeError(
-            "HF_TOKEN manquant. Créez un token sur huggingface.co, acceptez les licences "
-            "de pyannote/speaker-diarization-3.1 et pyannote/segmentation-3.0, "
-            "puis définissez HF_TOKEN dans .env."
-        )
-
-    huggingface_hub.login(token=hf_token, add_to_git_credential=False)
-
-    # PyTorch >= 2.6 : weights_only=True par défaut bloque les classes pyannote.
-    # On force weights_only=False uniquement pendant ce chargement (source HF officielle).
-    _orig_load = torch.load
-    torch.load = lambda *a, **kw: _orig_load(*a, **{**kw, "weights_only": False})
-    try:
-        _diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
-    finally:
-        torch.load = _orig_load
+        raise RuntimeError("HF_TOKEN manquant. Acceptez les conditions de Community-1 sur Hugging Face.")
+    set_telemetry_metrics(False)
+    pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-community-1", token=hf_token,
+        revision="3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
+    )
+    if pipeline is None:
+        raise RuntimeError("Impossible de charger Community-1. Vérifiez l'accès au modèle.")
     if torch.cuda.is_available():
-        _diarization_pipeline = _diarization_pipeline.to(torch.device("cuda"))
-    return _diarization_pipeline
+        pipeline.to(torch.device("cuda"))
+    _diarization_pipeline = pipeline
+    return pipeline
 
 
-def diarize_audio(wav_path: str, job_id: str | None = None) -> list[dict]:
-    """Retourne [{start, end, speaker}, ...] via pyannote/speaker-diarization-3.1."""
-    if job_id:
-        log(job_id, "Diarisation : identification des locuteurs (pyannote)...", "step")
-    diarization = _get_diarization_pipeline()(wav_path)
+def diarize_audio(wav_path: str, job_id: str, speaker_options: dict) -> list[dict]:
+    import torch
+
+    log(job_id, "Diarisation : identification des locuteurs avec Community-1.", "step")
+    pipeline = _get_diarization_pipeline()
+    frames, sample_rate = sf.read(wav_path, dtype="float32", always_2d=True)
+    output = pipeline(
+        {"waveform": torch.from_numpy(frames.T), "sample_rate": sample_rate}, **speaker_options,
+    )
     segments = [
         {"start": turn.start, "end": turn.end, "speaker": speaker}
-        for turn, _, speaker in diarization.itertracks(yield_label=True)
+        for turn, _, speaker in output.exclusive_speaker_diarization.itertracks(yield_label=True)
     ]
-    if job_id:
-        n_speakers = len({s["speaker"] for s in segments})
-        log(job_id, f"Diarisation terminée : {n_speakers} locuteur(s) identifié(s)", "success")
+    count = len({segment["speaker"] for segment in segments})
+    log(job_id, f"Diarisation terminée : {count} locuteur(s) identifié(s).", "success")
     return segments
 
 
-def assign_speakers(whisper_segments: list, diar_segments: list) -> str:
-    """
-    Aligne les segments Whisper (timestampés) sur les segments de diarisation
-    par chevauchement maximal. Produit : [Locuteur N | mm:ss -> mm:ss] texte
-    """
-    seen: list = []
-    for d in diar_segments:
-        if d["speaker"] not in seen:
-            seen.append(d["speaker"])
-    names = {sp: f"Locuteur {i + 1}" for i, sp in enumerate(seen)}
-
-    lines = []
-    for seg in whisper_segments:
-        best, best_overlap = None, 0.0
-        for d in diar_segments:
-            overlap = max(0.0, min(seg.end, d["end"]) - max(seg.start, d["start"]))
-            if overlap > best_overlap:
-                best_overlap, best = overlap, d["speaker"]
-        name = names.get(best, "Inconnu") if best else "Inconnu"
-        sm, ss = int(seg.start // 60), seg.start % 60
-        em, es = int(seg.end // 60), seg.end % 60
-        lines.append(f"[{name} | {sm:02d}:{ss:05.2f} -> {em:02d}:{es:05.2f}] {seg.text.strip()}")
-    return "\n".join(lines)
 
 
-def _build_speaker_meta(whisper_segments: list, diar_segments: list) -> list[dict]:
-    """
-    Construit les metadonnees par locuteur pour la modale de renommage.
-    Retourne [{id, label, clip_start, clip_end, excerpt}, ...] dans l'ordre d'apparition.
-    """
-    seen: list = []
-    for d in diar_segments:
-        if d["speaker"] not in seen:
-            seen.append(d["speaker"])
-
+def _build_speaker_meta(segments: list, diar_segments: list) -> list[dict]:
+    turns_by_speaker = {}
+    for turn in diar_segments:
+        turns_by_speaker.setdefault(turn["speaker"], []).append(turn)
     meta = []
-    for i, speaker_id in enumerate(seen):
-        label = f"Locuteur {i + 1}"
-        speaker_diar = [d for d in diar_segments if d["speaker"] == speaker_id]
-        if not speaker_diar:
-            continue
+    for i, (speaker_id, speaker_diar) in enumerate(turns_by_speaker.items(), 1):
+        # Choisir le passage le plus long, avec un extrait de 8 s maximum.
+        longest = max(speaker_diar, key=lambda d: d["end"] - d["start"])
+        clip_start = longest["start"]
+        clip_end = min(longest["end"], clip_start + 8.0)
 
-        # Premier segment de ce locuteur — clip de 8s maximum
-        first = speaker_diar[0]
-        clip_start = first["start"]
-        clip_end   = min(first["end"], clip_start + 8.0)
-
-        # Premier segment Whisper qui chevauche la region du clip
-        excerpt = ""
-        for seg in whisper_segments:
-            if max(seg.start, clip_start - 1.0) < min(seg.end, clip_end + 5.0):
-                excerpt = seg.text.strip()
-                break
+        excerpt = next((
+            seg["text"] for seg in segments if seg["speaker_id"] == speaker_id
+            and seg["start"] < clip_end and seg["end"] > clip_start
+        ), "")
 
         meta.append({
             "id":         speaker_id,
-            "label":      label,
+            "label":      f"Locuteur {i}",
             "clip_start": clip_start,
             "clip_end":   clip_end,
             "excerpt":    excerpt,
+            "speech_secs": round(sum(d["end"] - d["start"] for d in speaker_diar), 1),
         })
     return meta
 
 
-def _build_segments(whisper_segs: list, diar_segments: list | None = None) -> list[dict]:
-    """
-    Construit [{start, end, text, speaker}] a partir des segments Whisper.
-    Si diar_segments fourni, ajoute le locuteur par max-overlap.
-    """
-    names: dict = {}
-    if diar_segments:
-        seen: list = []
-        for d in diar_segments:
-            if d["speaker"] not in seen:
-                seen.append(d["speaker"])
-        names = {sp: f"Locuteur {i + 1}" for i, sp in enumerate(seen)}
+def _speaker_lookup(diar_segments):
+    turns = sorted(diar_segments, key=lambda turn: turn["start"])
+    speaker_ids = dict.fromkeys(turn["speaker"] for turn in diar_segments)
+    labels = {speaker: f"Locuteur {i}" for i, speaker in enumerate(speaker_ids, 1)}
+    first_turn = 0
 
+    def lookup(start, end):
+        nonlocal first_turn
+        while first_turn < len(turns) and turns[first_turn]["end"] <= start:
+            first_turn += 1
+        overlaps = {}
+        for index in range(first_turn, len(turns)):
+            turn = turns[index]
+            if turn["start"] >= end:
+                break
+            overlap = min(end, turn["end"]) - max(start, turn["start"])
+            if overlap > 0:
+                speaker = turn["speaker"]
+                overlaps[speaker] = overlaps.get(speaker, 0.0) + overlap
+        speaker = max(overlaps, key=overlaps.get) if overlaps else None
+        return {"speaker_id": speaker, "speaker": labels.get(speaker, "Inconnu")}
+
+    return lookup
+
+
+def _build_segments(whisper_segs: list, diar_segments: list | None = None) -> list[dict]:
+    if diar_segments is None:
+        return [
+            {"start": round(seg.start, 3), "end": round(seg.end, 3),
+             "text": seg.text.strip(), "speaker": None}
+            for seg in whisper_segs
+        ]
+
+    lookup = _speaker_lookup(diar_segments)
     result = []
     for seg in whisper_segs:
-        speaker = None
-        if diar_segments:
-            best, best_ov = None, 0.0
-            for d in diar_segments:
-                ov = max(0.0, min(seg.end, d["end"]) - max(seg.start, d["start"]))
-                if ov > best_ov:
-                    best_ov, best = ov, d["speaker"]
-            speaker = names.get(best, "Inconnu") if best else "Inconnu"
-        result.append({
-            "start":   round(seg.start, 3),
-            "end":     round(seg.end,   3),
-            "text":    seg.text.strip(),
-            "speaker": speaker,
-        })
+        group = None
+        words = seg.words
+        for part in words or [seg]:
+            assignment = lookup(part.start, part.end)
+            text = part.word if words else part.text
+            if group and group["speaker_id"] == assignment["speaker_id"]:
+                group["end"] = round(part.end, 3)
+                group["text"] += text
+            else:
+                group = {
+                    "start": round(part.start, 3), "end": round(part.end, 3),
+                    "text": text, **assignment,
+                }
+                result.append(group)
+    for segment in result:
+        segment["text"] = segment["text"].strip()
     return result
+
+
+def _timestamp(value: float) -> str:
+    minutes, centiseconds = divmod(round(value * 100), 6000)
+    return f"{minutes:02d}:{centiseconds / 100:05.2f}"
+
+
+def _diarized_transcript(segments):
+    return "\n".join(
+        f"[{seg['speaker']} | {_timestamp(seg['start'])} -> {_timestamp(seg['end'])}] {seg['text']}"
+        for seg in segments
+    )
 
 
 def _save_speaker_clips(job_id: str, speaker_meta: list, wav_path: str) -> None:
@@ -419,7 +492,7 @@ def _save_speaker_clips(job_id: str, speaker_meta: list, wav_path: str) -> None:
         if duration <= 0:
             continue
         mp3_path = os.path.join(
-            tempfile.gettempdir(),
+            _job_directory(job_id),
             f"lexia_{job_id}_spk_{speaker['id']}.mp3",
         )
         try:
@@ -429,11 +502,11 @@ def _save_speaker_clips(job_id: str, speaker_meta: list, wav_path: str) -> None:
                  "-t",  str(duration),
                  "-i",  wav_path,
                  "-b:a", "64k", mp3_path],
-                capture_output=True, check=True,
+                capture_output=True, check=True, timeout=30,
             )
             clips[speaker["id"]] = mp3_path
-        except subprocess.CalledProcessError:
-            pass
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            app.logger.warning("Extrait de locuteur indisponible pour le job %s", job_id)
     _speaker_clips[job_id] = clips
 
 
@@ -441,270 +514,196 @@ def _save_speaker_clips(job_id: str, speaker_meta: list, wav_path: str) -> None:
 # Transcription
 # ---------------------------------------------------------------------------
 
-def transcribe_with_canary(wav_path: str, tmpdir: str, job_id: str) -> str:
-    log(job_id, "Découpage de l'audio en segments de 40s (limite Canary-Qwen)...", "step")
+def transcribe_with_canary(wav_path: str, tmpdir: str, job_id: str, model) -> str:
     chunk_paths, total_secs = split_audio(wav_path, CANARY_CHUNK_SECS, tmpdir)
-    n = len(chunk_paths)
-    log(job_id, f"Audio total : {total_secs:.1f}s → {n} chunk{'s' if n > 1 else ''} de {CANARY_CHUNK_SECS}s", "info")
     parts = []
     for i, chunk_path in enumerate(chunk_paths):
-        start_s = i * CANARY_CHUNK_SECS
-        end_s   = min((i + 1) * CANARY_CHUNK_SECS, total_secs)
-        log(job_id, f"Canary-Qwen-2.5B — chunk {i+1}/{n} [{start_s:.0f}s → {end_s:.0f}s] en cours...", "model")
-        answer_ids = canary_model.generate(
+        log(job_id, f"Canary - passage {i + 1}/{len(chunk_paths)}", "model")
+        answer_ids = model.generate(
             prompts=[[{
-                "role":    "user",
-                "content": f"Transcribe the following: {canary_model.audio_locator_tag}",
-                "audio":   [chunk_path],
+                "role": "user",
+                "content": f"Transcribe the following: {model.audio_locator_tag}",
+                "audio": [chunk_path],
             }]],
             max_new_tokens=1024,
         )
-        text = canary_model.tokenizer.ids_to_text(answer_ids[0].cpu()).strip()
-        log(job_id, f"Chunk {i+1}/{n} transcrit ({len(text)} caractères)", "success")
-        parts.append(text)
-    log(job_id, f"Assemblage des {n} chunks en transcript final...", "step")
+        parts.append(model.tokenizer.ids_to_text(answer_ids[0].cpu()).strip())
+        jobs[job_id]["processed_secs"] = min((i + 1) * CANARY_CHUNK_SECS, total_secs)
     return " ".join(parts)
 
 
-def transcribe_with_whisper(
-    wav_path: str,
-    language: str | None,
-    job_id: str | None = None,
-    return_segments: bool = False,
-):
-    segments_list = []
-    segments, info = whisper_model.transcribe(
-        wav_path,
-        beam_size=5,
-        language=language if language not in (None, "auto") else None,
-        vad_filter=True,
+def _whisper_segments(wav_path: str, language: str, diarize: bool = False):
+    return _whisper_model().transcribe(
+        wav_path, beam_size=5, language=None if language == "auto" else language,
+        vad_filter=True, word_timestamps=diarize,
     )
-    for seg in segments:
-        segments_list.append(seg)
-        if job_id:
-            log(job_id, f"[{seg.start:.1f}s → {seg.end:.1f}s] {seg.text.strip()}", "segment")
-    transcript = "\n".join(s.text.strip() for s in segments_list)
-    if return_segments:
-        return transcript, info.language, segments_list
-    return transcript, info.language
 
 
-def _route_and_transcribe(
-    wav_path: str,
-    tmpdir: str,
-    language: str,
-    diarize: bool,
-    job_id: str,
-) -> tuple[str, str, str]:
-    """
-    Routing vers le bon modele. Retourne (transcript, detected_lang, model_used).
-    Quand diarize=True : Whisper uniquement (timestamps requis), puis pyannote.
-    """
-    if diarize:
-        log(job_id, "Diarisation activée — Whisper large-v3 utilisé pour les timestamps...", "step")
-        lang_param = None if language == "auto" else language
-        transcript, detected_lang, segments = transcribe_with_whisper(
-            wav_path, lang_param, job_id, return_segments=True
-        )
-        diar_segments = diarize_audio(wav_path, job_id)
-        transcript = assign_speakers(segments, diar_segments)
-        speaker_meta = _build_speaker_meta(segments, diar_segments)
-        jobs[job_id]["speakers"]  = speaker_meta
-        jobs[job_id]["segments"]  = _build_segments(segments, diar_segments)
-        _save_speaker_clips(job_id, speaker_meta, wav_path)
-        jobs[job_id]["diarized"] = True
-        return transcript, detected_lang, "Whisper large-v3 + Diarisation"
-
-    if language == "en":
-        log(job_id, "Langue : anglais forcé → Canary-Qwen-2.5B", "step")
-        return transcribe_with_canary(wav_path, tmpdir, job_id), "en", "Canary-Qwen-2.5B"
-
-    if language == "auto":
-        log(job_id, "Détection automatique de la langue via Whisper...", "step")
+def _route_and_transcribe(wav_path, raw_wav, tmpdir, language, diarize, speaker_options, job_id,
+                          timestamps=False):
+    stream = info = None
+    if not diarize and not timestamps and language == "auto":
         jobs[job_id]["status"] = "detecting"
-        _, detected_lang = transcribe_with_whisper(wav_path, None)
-        log(job_id, f"Langue détectée : {detected_lang}", "info")
-        jobs[job_id]["status"] = "transcribing"
-        if detected_lang == "en":
-            log(job_id, "Anglais détecté → Canary-Qwen-2.5B", "step")
-            return transcribe_with_canary(wav_path, tmpdir, job_id), "en", "Canary-Qwen-2.5B (anglais détecté)"
-        log(job_id, f"Langue non-anglaise ({detected_lang}) → Whisper large-v3", "step")
-        transcript, detected_lang, segs = transcribe_with_whisper(wav_path, None, job_id, return_segments=True)
-        jobs[job_id]["segments"] = _build_segments(segs)
-        return transcript, detected_lang, f"Whisper large-v3 ({detected_lang} détecté)"
-
-    log(job_id, f"Langue explicite ({language}) → Whisper large-v3", "step")
-    transcript, detected_lang, segs = transcribe_with_whisper(wav_path, language, job_id, return_segments=True)
-    jobs[job_id]["segments"] = _build_segments(segs)
-    return transcript, detected_lang, "Whisper large-v3"
-
-
-# ---------------------------------------------------------------------------
-# Audio persistant pour téléchargement
-# ---------------------------------------------------------------------------
-
-def _trim_wav(wav_path: str, duration_secs: int) -> None:
-    """Tronque le WAV en place à duration_secs secondes."""
-    tmp = wav_path + ".trim.wav"
-    subprocess.run(
-        [FFMPEG_BIN, "-y", "-i", wav_path, "-t", str(duration_secs), tmp],
-        capture_output=True, check=True,
+        # Whisper fournit la langue avant de consommer le generateur de segments.
+        stream, info = _whisper_segments(wav_path, language)
+    jobs[job_id]["status"] = "transcribing"
+    use_canary = language == "en" or (
+        info is not None and info.language == "en" and info.duration_after_vad > 0
     )
-    os.replace(tmp, wav_path)
+    if not diarize and not timestamps and use_canary:
+        try:
+            model = _canary_model()
+            transcript = transcribe_with_canary(wav_path, tmpdir, job_id, model)
+        except Exception:
+            app.logger.exception("Transcription Canary indisponible")
+            log(job_id, "Canary indisponible, transcription avec Whisper.", "info")
+            jobs[job_id]["processed_secs"] = 0
+        else:
+            return transcript, "en", "Canary-Qwen-2.5B"
+
+    if stream is None:
+        stream, info = _whisper_segments(wav_path, language, diarize)
+    whisper_segments = []
+    for segment in stream:
+        whisper_segments.append(segment)
+        jobs[job_id]["processed_secs"] = segment.end
+    diar_segments = None
+    if diarize:
+        jobs[job_id]["status"] = "diarizing"
+        try:
+            diar_segments = diarize_audio(raw_wav, job_id, speaker_options)
+        except Exception:
+            app.logger.exception("Détection des voix indisponible pour le job %s", job_id)
+            jobs[job_id]["diarization_warning"] = (
+                "Le texte est prêt, mais les voix n’ont pas pu être distinguées. "
+                "Vérifiez la détection dans les réglages avancés, puis relancez-la depuis le lecteur."
+            )
+            log(job_id, "La transcription est conservée sans attribution des voix.", "info")
+
+    segments = _build_segments(whisper_segments, diar_segments)
+    jobs[job_id]["segments"] = segments
+    if diar_segments is None:
+        return "\n".join(seg["text"] for seg in segments), info.language, "Whisper large-v3"
+
+    speaker_meta = _build_speaker_meta(segments, diar_segments)
+    jobs[job_id].update(speakers=speaker_meta, diarized=True,
+                        speaker_options=speaker_options, diarization_turns=diar_segments)
+    _save_speaker_clips(job_id, speaker_meta, raw_wav)
+    return _diarized_transcript(segments), info.language, "Whisper large-v3 + Diarisation"
 
 
 def _save_job_audio(job_id: str, wav_path: str) -> None:
-    """Re-encode le WAV traité en MP3 128k et le conserve pour téléchargement."""
-    mp3_path = os.path.join(tempfile.gettempdir(), f"lexia_{job_id}.mp3")
+    mp3_path = _job_directory(job_id) / "audio.mp3"
     try:
         subprocess.run(
-            [FFMPEG_BIN, "-y", "-i", wav_path, "-b:a", "128k", mp3_path],
-            capture_output=True, check=True,
+            [FFMPEG_BIN, "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-y", "-i", wav_path, "-b:a", "128k", mp3_path],
+            capture_output=True, check=True, timeout=MEDIA_TIMEOUT,
         )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        app.logger.warning("Encodage MP3 impossible pour le job %s", job_id)
+        log(job_id, "Téléchargement MP3 indisponible.", "info")
+    else:
         _audio_files[job_id] = mp3_path
         jobs[job_id]["audio_available"] = True
-        log(job_id, "Audio MP3 disponible pour téléchargement.", "info")
-    except subprocess.CalledProcessError as e:
-        log(job_id, f"Encodage MP3 échoué (téléchargement indisponible) : {e.stderr.decode()}", "error")
 
 
-# ---------------------------------------------------------------------------
-# Runners (threads)
-# ---------------------------------------------------------------------------
-
-def run_transcription_from_file(
-    job_id: str,
-    file_path: str,
-    upload_dir: str,
-    language: str,
-    preprocess: bool = True,
-    diarize: bool = False,
-    test_mode: int = 0,
-) -> None:
-    log(job_id, "Démarrage du job depuis un fichier local", "step")
-    log(job_id, f"Fichier : {os.path.basename(file_path)}", "info")
-    log(job_id, f"Langue sélectionnée : {SUPPORTED_LANGUAGES.get(language, language)}", "info")
-
+def _transcribe_source(job_id, src, tmpdir, language, preprocess, diarize, test_mode, speaker_options,
+                       timestamps):
+    job = jobs[job_id]
+    job["status"] = "preparing"
+    raw_wav = os.path.join(tmpdir, "audio.wav")
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            size_mb = os.path.getsize(file_path) / 1024 / 1024
-            log(job_id, f"Taille du fichier : {size_mb:.1f} Mo", "info")
+        convert_to_wav(src, raw_wav, test_mode or MAX_AUDIO_SECONDS + 1)
+    except subprocess.CalledProcessError:
+        _fail_job(job_id, "Format audio non reconnu par FFmpeg.")
+        return
+    duration = sf.info(raw_wav).duration
+    if not 0 < duration <= MAX_AUDIO_SECONDS:
+        _fail_job(job_id, "L'audio est vide ou dépasse la durée maximale de 4 heures.")
+        return
+    job.update(duration_secs=round(duration, 2), test_mode=test_mode)
+    wav_path = raw_wav
+    if preprocess:
+        wav_path = os.path.join(tmpdir, "processed.wav")
+        shutil.copyfile(raw_wav, wav_path)
+        preprocess_audio(wav_path, job_id)
 
-            log(job_id, "Conversion en WAV 16kHz mono via ffmpeg...", "step")
-            wav_path = os.path.join(tmpdir, "audio.wav")
-            try:
-                convert_to_wav(file_path, wav_path)
-            except subprocess.CalledProcessError as e:
-                _fail_job(job_id, f"Erreur ffmpeg : {e.stderr.decode()}")
-                return
-            log(job_id, f"WAV généré : {os.path.getsize(wav_path)/1024/1024:.1f} Mo @ {SAMPLE_RATE}Hz mono", "success")
-
-            if test_mode:
-                _trim_wav(wav_path, test_mode)
-                log(job_id, f"Mode test : audio tronqué à {test_mode} secondes.", "step")
-                jobs[job_id]["test_mode"] = test_mode
-
-            if preprocess:
-                preprocess_audio(wav_path, job_id)
-
-            try:
-                _info = sf.info(wav_path)
-                jobs[job_id]["duration_secs"] = round(_info.frames / _info.samplerate, 1)
-            except Exception:
-                pass
-
-            _save_job_audio(job_id, wav_path)
-
-            jobs[job_id]["status"] = "transcribing"
-            transcript, detected_lang, model_used = _route_and_transcribe(
-                wav_path, tmpdir, language, diarize, job_id
-            )
-            _finish_job(job_id, transcript, detected_lang, model_used)
-
-    except Exception as e:
-        _fail_job(job_id, f"Erreur : {e}\n{traceback.format_exc()}")
-    finally:
-        shutil.rmtree(upload_dir, ignore_errors=True)
+    job["status"] = "waiting_gpu"
+    with gpu_lock:
+        transcript, detected_lang, model_used = _route_and_transcribe(
+            wav_path, raw_wav, tmpdir, language, diarize, speaker_options, job_id, timestamps
+        )
+    _save_job_audio(job_id, wav_path)
+    if job["segments"]:
+        try:
+            os.replace(raw_wav, _job_directory(job_id) / "source.wav")
+        except OSError:
+            app.logger.exception("Audio de relance indisponible pour le job %s", job_id)
+        else:
+            job["rediarize_available"] = True
+    _finish_job(job_id, transcript, detected_lang, model_used)
 
 
-def run_transcription(
-    job_id: str,
-    url: str,
-    language: str,
-    preprocess: bool = True,
-    diarize: bool = False,
-    test_mode: int = 0,
-) -> None:
+def run_transcription_from_file(job_id, file_path, options) -> None:
+    with tempfile.TemporaryDirectory(dir=_job_directory(job_id)) as tmpdir:
+        try:
+            _transcribe_source(job_id, file_path, tmpdir, **options)
+        finally:
+            file_path.unlink(missing_ok=True)
+
+
+def run_transcription(job_id, url, options) -> None:
     jobs[job_id]["status"] = "downloading"
-    log(job_id, "Démarrage du job de transcription", "step")
-    log(job_id, f"URL cible : {url}", "info")
-    log(job_id, f"Langue sélectionnée : {SUPPORTED_LANGUAGES.get(language, language)}", "info")
+    log(job_id, "Téléchargement de la piste audio.", "step")
+    with tempfile.TemporaryDirectory(dir=_job_directory(job_id)) as tmpdir:
+        try:
+            result = subprocess.run(
+                YTDLP_BIN + [
+                    "-f", "ba/b", "--max-filesize", "512M", "--no-simulate",
+                    "--print", "before_dl:LEXIA_TITLE %(title)s",
+                    "--print", "after_move:LEXIA_FILE %(filepath)s",
+                    "-o", os.path.join(tmpdir, "source.%(ext)s"), "--", url,
+                ],
+                env=YTDLP_ENV, encoding="utf-8", errors="replace", capture_output=True,
+                check=True, timeout=DOWNLOAD_TIMEOUT,
+            )
+        except subprocess.CalledProcessError:
+            _fail_job(job_id, "Impossible de télécharger l'audio depuis cette URL.")
+            return
+        source = None
+        for line in result.stdout.splitlines():
+            if line.startswith("LEXIA_TITLE "):
+                jobs[job_id]["title"] = line.removeprefix("LEXIA_TITLE ")[:200]
+            elif line.startswith("LEXIA_FILE "):
+                source = Path(line.removeprefix("LEXIA_FILE ")).resolve()
+        if (source is None or source.parent != Path(tmpdir).resolve()
+                or not source.is_file() or source.stat().st_size > app.config["MAX_CONTENT_LENGTH"]):
+            _fail_job(job_id, "Aucun audio téléchargé ou limite de taille dépassée.")
+            return
+        _transcribe_source(job_id, source, tmpdir, **options)
 
+
+def run_rediarization(job_id, source, original_segments, speaker_options):
+    job = jobs[job_id]
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            log(job_id, "Récupération du titre de la vidéo via yt-dlp...", "step")
-            title_result = subprocess.run(
-                YTDLP_BIN + ["--no-playlist", "--print", "title", url],
-                capture_output=True, text=True,
-            )
-            
-            title = title_result.stdout.strip().split("\n")[0] or "transcript"
-            jobs[job_id]["title"] = title
-            log(job_id, f"Titre : « {title} »", "info")
-
-            log(job_id, "Téléchargement de la piste audio (yt-dlp → mp3)...", "step")
-            dl = subprocess.run(
-                YTDLP_BIN + ["-x", "--audio-format", "mp3", "--audio-quality", "0",
-                 "-o", os.path.join(tmpdir, "audio.%(ext)s"), "--no-playlist", url],
-                capture_output=True, text=True,
-            )
-            if dl.returncode != 0:
-                _fail_job(job_id, dl.stderr.strip() or "Erreur lors du téléchargement")
-                return
-
-            audio_file = next(
-                (os.path.join(tmpdir, f) for f in os.listdir(tmpdir)
-                 if f.endswith((".mp3", ".m4a", ".webm", ".opus"))),
-                None,
-            )
-            if not audio_file:
-                _fail_job(job_id, f"Fichier audio introuvable. Présents : {os.listdir(tmpdir)}")
-                return
-            log(job_id, f"Audio téléchargé : {os.path.basename(audio_file)} ({os.path.getsize(audio_file)/1024/1024:.1f} Mo)", "success")
-
-            log(job_id, "Conversion en WAV 16kHz mono (requis par les modèles ASR)...", "step")
-            wav_path = os.path.join(tmpdir, "audio.wav")
+        job["status"] = "waiting_gpu"
+        with gpu_lock:
+            job["status"] = "diarizing"
             try:
-                convert_to_wav(audio_file, wav_path)
-            except subprocess.CalledProcessError as e:
-                _fail_job(job_id, f"Erreur ffmpeg : {e.stderr.decode()}")
-                return
-            log(job_id, f"WAV généré : {os.path.getsize(wav_path)/1024/1024:.1f} Mo @ {SAMPLE_RATE}Hz mono", "success")
-
-            if test_mode:
-                _trim_wav(wav_path, test_mode)
-                log(job_id, f"Mode test : audio tronqué à {test_mode} secondes.", "step")
-                jobs[job_id]["test_mode"] = test_mode
-
-            if preprocess:
-                preprocess_audio(wav_path, job_id)
-
-            try:
-                _info = sf.info(wav_path)
-                jobs[job_id]["duration_secs"] = round(_info.frames / _info.samplerate, 1)
+                turns = diarize_audio(source, job_id, speaker_options)
             except Exception:
-                pass
-
-            _save_job_audio(job_id, wav_path)
-
-            jobs[job_id]["status"] = "transcribing"
-            transcript, detected_lang, model_used = _route_and_transcribe(
-                wav_path, tmpdir, language, diarize, job_id
-            )
-            _finish_job(job_id, transcript, detected_lang, model_used)
-
-    except Exception as e:
-        _fail_job(job_id, f"Erreur : {e}\n{traceback.format_exc()}")
+                app.logger.exception("Détection des voix indisponible pour le job %s", job_id)
+                _fail_job(job_id, "La détection des voix a échoué. Vérifiez-la dans les réglages avancés de la page principale.")
+                return
+        lookup = _speaker_lookup(turns)
+        segments = [{**seg, **lookup(seg["start"], seg["end"])} for seg in original_segments]
+        speakers = _build_speaker_meta(segments, turns)
+        _save_speaker_clips(job_id, speakers, source)
+        job.update(segments=segments, speakers=speakers, diarized=True, transcript=_diarized_transcript(segments),
+                   diarization_turns=turns, status="done")
+    finally:
+        source.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -719,26 +718,11 @@ _PROGRESS_TEMPLATE = (
 )
 
 
-def _purge_stale_video_dirs() -> None:
-    """Supprime les videos laissees par une execution precedente du serveur."""
-    tmp_root = tempfile.gettempdir()
-    for name in os.listdir(tmp_root):
-        if name.startswith(VIDEO_DIR_PREFIX):
-            shutil.rmtree(os.path.join(tmp_root, name), ignore_errors=True)
-
-
 def _video_format_args(quality: str) -> list[str]:
-    """
-    Selection du format : meilleure video + meilleur audio fusionnes en MP4.
-    Le tri -S privilegie la resolution, puis a resolution egale le h264 et les
-    conteneurs MP4/M4A : fichier lisible partout, sans re-encodage a la fusion.
-    Sur YouTube, cette selection requiert deno (sinon seuls des formats degrades
-    et souvent refuses en 403 sont proposes).
-    """
     height = VIDEO_QUALITIES[quality]
-    res  = f"res:{height}" if height else "res"
-    sort = f"{res},vcodec:h264,ext:mp4:m4a"
-    return ["-f", "bv*+ba/b", "-S", sort, "--merge-output-format", "mp4"]
+    cap = f"[height<={height}]" if height else ""
+    return ["-f", f"bv*{cap}+ba/b{cap}", "-S", "res,vcodec:h264,ext:mp4:m4a",
+            "--merge-output-format", "mp4"]
 
 
 def _parse_progress(line: str) -> dict | None:
@@ -749,7 +733,8 @@ def _parse_progress(line: str) -> dict | None:
 
     def num(value: str) -> float | None:
         try:
-            return float(value)
+            number = float(value)
+            return number if math.isfinite(number) and number >= 0 else None
         except ValueError:
             return None
 
@@ -764,114 +749,231 @@ def _parse_progress(line: str) -> dict | None:
     }
 
 
+def _stop_download(proc) -> None:
+    import psutil
+
+    if proc.poll() is not None:
+        return
+    try:
+        parent = psutil.Process(proc.pid)
+        processes = parent.children(recursive=True) + [parent]
+    except psutil.NoSuchProcess:
+        return
+    for process in reversed(processes):
+        try:
+            process.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            app.logger.warning("Impossible d'arrêter un processus du téléchargement")
+
+
 def run_video_download(job_id: str, url: str, quality: str) -> None:
     job = jobs[job_id]
     job["status"] = "downloading"
-    log(job_id, "Démarrage du téléchargement vidéo", "step")
-    log(job_id, f"URL cible : {url}", "info")
-    log(job_id, f"Qualité demandée : {'meilleure disponible' if quality == 'best' else quality + 'p max'}", "info")
+    log(job_id, "Téléchargement des flux vidéo et audio.", "step")
+    out_dir = _job_directory(job_id)
+    cmd = YTDLP_BIN + _video_format_args(quality) + [
+        "--newline", "--no-colors", "--progress", "--no-simulate", "--max-filesize", "2G",
+        "--progress-template", _PROGRESS_TEMPLATE,
+        "--print", "before_dl:LEXIA_TITLE %(title)s",
+        "--print", "after_move:LEXIA_FILE %(filepath)s",
+        "-o", str(out_dir / "video.%(ext)s"), "--", url,
+    ]
+    video_path = None
+    stream = 0
+    with subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        text=True, encoding="utf-8", errors="replace", env=YTDLP_ENV,
+    ) as proc:
+        deadline = threading.Timer(DOWNLOAD_TIMEOUT, _stop_download, args=(proc,))
+        deadline.daemon = True
+        deadline.start()
+        try:
+            for raw in proc.stdout:
+                line = raw.strip()
+                if line.startswith(_PROGRESS_TAG):
+                    progress = _parse_progress(line)
+                    if progress:
+                        job["progress"] = {**progress, "stream": stream}
+                elif line.startswith("LEXIA_TITLE "):
+                    job["title"] = line.removeprefix("LEXIA_TITLE ")[:200]
+                elif line.startswith("LEXIA_FILE "):
+                    video_path = Path(line.removeprefix("LEXIA_FILE ")).resolve()
+                elif line.startswith("[download] Destination:"):
+                    stream += 1
+                elif line.startswith("[Merger]"):
+                    job["status"] = "merging"
+            proc.wait()
+        except Exception:
+            _stop_download(proc)
+            raise
+        finally:
+            deadline.cancel()
 
-    out_dir = tempfile.mkdtemp(prefix=VIDEO_DIR_PREFIX)
-    # Force l'UTF-8 sur la sortie de yt-dlp (titres accentues sous Windows)
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-    try:
-        log(job_id, "Récupération du titre de la vidéo via yt-dlp...", "step")
-        title_result = subprocess.run(
-            YTDLP_BIN + ["--no-playlist", "--print", "title", "--", url],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
-        )
-        if title_result.returncode != 0:
-            _fail_job(job_id, title_result.stderr.strip() or "URL non prise en charge par yt-dlp")
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return
-        job["title"] = title_result.stdout.strip().split("\n")[0] or "video"
-        log(job_id, f"Titre : « {job['title']} »", "info")
+    if (proc.returncode != 0 or video_path is None
+            or video_path.parent != out_dir.resolve() or not video_path.is_file()):
+        _fail_job(job_id, "Téléchargement vidéo impossible. Vérifiez l'URL, la qualité ou la taille.")
+        return
+    size = video_path.stat().st_size
+    if size > 2 * 1024 ** 3:
+        _fail_job(job_id, "La vidéo dépasse la taille maximale de 2 Gio.")
+        return
 
-        log(job_id, "Téléchargement des flux vidéo et audio...", "step")
-        cmd = YTDLP_BIN + _video_format_args(quality) + [
-            "--no-playlist", "--newline", "--no-colors",
-            "--progress-template", _PROGRESS_TEMPLATE,
-            "-o", os.path.join(out_dir, "video.%(ext)s"),
-            "--", url,
-        ]
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", env=env,
-        )
-        errors = []
-        stream = 0
-        for raw in proc.stdout:
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith(_PROGRESS_TAG):
-                progress = _parse_progress(line)
-                if progress:
-                    job["progress"] = {**progress, "stream": stream}
-            elif line.startswith("[download] Destination:"):
-                # Un flux par destination : video puis audio quand ils sont separes
-                stream += 1
-                log(job_id, f"Flux {stream} : {os.path.basename(line.split(':', 1)[1].strip())}", "model")
-            elif line.startswith("[Merger]"):
-                job["status"] = "merging"
-                log(job_id, "Fusion vidéo + audio en MP4 (ffmpeg)...", "step")
-            elif line.startswith("ERROR:"):
-                errors.append(line)
-                log(job_id, line, "error")
-            elif line.startswith("WARNING:"):
-                log(job_id, line, "info")
-        proc.wait()
-
-        if proc.returncode != 0:
-            _fail_job(job_id, "\n".join(errors) or "Erreur lors du téléchargement")
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return
-
-        # Seul le fichier final subsiste apres la fusion ; on ignore les residus partiels
-        candidates = [
-            os.path.join(out_dir, f) for f in os.listdir(out_dir)
-            if not f.endswith((".part", ".ytdl", ".temp"))
-        ]
-        if not candidates:
-            _fail_job(job_id, "Fichier vidéo introuvable après téléchargement")
-            shutil.rmtree(out_dir, ignore_errors=True)
-            return
-        video_path = max(candidates, key=os.path.getsize)
-
-        _video_files[job_id] = video_path
-        size_mb = os.path.getsize(video_path) / 1024 / 1024
-        job.update({
-            "status":          "done",
-            "video_available": True,
-            "video_ext":       os.path.splitext(video_path)[1].lstrip(".") or "mp4",
-            "file_size_mb":    round(size_mb, 1),
-            "progress":        {"percent": 100.0, "speed": None, "eta": 0, "stream": stream},
-        })
-        log(job_id, f"Vidéo prête : {os.path.basename(video_path)} ({size_mb:.1f} Mo)", "success")
-
-    except Exception as e:
-        _fail_job(job_id, f"Erreur : {e}\n{traceback.format_exc()}")
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
-_purge_stale_video_dirs()
+    _video_files[job_id] = video_path
+    log(job_id, "Vidéo prête.", "success")
+    job.update(
+        status="done", video_available=True, video_ext=video_path.suffix.lstrip("."),
+        file_size_mb=round(size / 1024 ** 2, 1),
+        progress={"percent": 100.0, "speed": None, "eta": 0, "stream": stream},
+    )
 
 
 # ---------------------------------------------------------------------------
 # Routes Flask
 # ---------------------------------------------------------------------------
 
+@app.errorhandler(HTTPException)
+def http_error(exc):
+    return jsonify({"error": exc.description}), exc.code
+
+
+@app.after_request
+def live_cors(response):
+    if request.endpoint == "transcribe_live":
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    if request.endpoint in ("transcribe_live", "status", "get_logs", "download_audio",
+                            "download_video_file", "speaker_audio"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _json_object():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise ValueError("Un objet JSON est attendu.")
+    return data
+
+
+def _read_url(data):
+    value = data.get("url")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("URL manquante.")
+    value = value.strip()
+    try:
+        url = urlsplit(value)
+        if (len(value) <= 4096 and url.scheme in ("https", "http") and url.hostname
+                and url.username is None and not any(ch.isspace() or ord(ch) < 32 for ch in value)):
+            _ = url.port
+            return value
+    except ValueError:
+        pass
+    raise ValueError("URL HTTP ou HTTPS invalide.")
+
+
+def _read_bool(data, key, default, form):
+    value = data.get(key, default)
+    if type(value) is bool:
+        return value
+    if form and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise ValueError(f"{key} doit être un booléen.")
+
+
+def _read_int(data, key, default, form, low, high):
+    value = data.get(key, default)
+    if form and isinstance(value, str):
+        if value == "":
+            return default
+        if value.isascii() and value.isdecimal() and len(value) <= 5:
+            value = int(value)
+    if type(value) is not int or not low <= value <= high:
+        raise ValueError(f"{key} doit être un entier de {low} à {high}.")
+    return value
+
+
+def _read_language(data):
+    value = data.get("language", "auto")
+    if isinstance(value, str) and value.strip() in SUPPORTED_LANGUAGES:
+        return value.strip()
+    raise ValueError("Langue non supportée.")
+
+
+def _read_speaker_options(data, form=False):
+    speakers = {}
+    for key in ("num_speakers", "min_speakers", "max_speakers"):
+        if key in data and data[key] != "":
+            speakers[key] = _read_int(data, key, None, form, 1, 20)
+    if "num_speakers" in speakers and len(speakers) > 1:
+        raise ValueError("Choisissez un nombre exact ou une fourchette de locuteurs.")
+    if speakers.get("min_speakers", 1) > speakers.get("max_speakers", 20):
+        raise ValueError("Le minimum de locuteurs dépasse le maximum.")
+    return speakers
+
+
+def _read_options(data, form=False):
+    diarize = _read_bool(data, "diarize", False, form)
+    speakers = _read_speaker_options(data, form)
+    if speakers and not diarize:
+        raise ValueError("Le nombre de locuteurs nécessite la diarisation.")
+    return {
+        "language": _read_language(data),
+        "preprocess": _read_bool(data, "preprocess", True, form),
+        "diarize": diarize,
+        "test_mode": _read_int(data, "test_mode", 0, form, 0, MAX_AUDIO_SECONDS),
+        "timestamps": _read_bool(data, "timestamps", False, form),
+        "speaker_options": speakers,
+    }
+
+
+def _start_job(target, args, *, slots, job=None, upload=None, source_audio=None):
+    if not slots.acquire(blocking=False):
+        return jsonify({"error": "Trop de traitements en cours. Réessayez dans un instant."}), 429
+    job_id = str(uuid.uuid4())
+    directory = _job_directory(job_id)
+    try:
+        directory.mkdir(parents=True)
+        if upload is not None:
+            source = directory / "input"
+            upload.save(source)
+            args = (source, *args)
+        elif source_audio is not None:
+            source = directory / "source.wav"
+            # Le travail peut continuer même si le résultat d'origine expire dans la file.
+            try:
+                os.link(source_audio, source)
+            except OSError:
+                shutil.copyfile(source_audio, source)
+            args = (source, *args)
+        _submit_job(job_id, job or _new_job(), target, args, slots)
+    except FileNotFoundError:
+        slots.release()
+        _remove_job_directory(job_id)
+        return jsonify({"error": "Audio source indisponible ou expiré."}), 404
+    except Exception:
+        slots.release()
+        _remove_job_directory(job_id)
+        app.logger.exception("Impossible de préparer le job %s", job_id)
+        return jsonify({"error": "Impossible de préparer le traitement."}), 500
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/")
+@app.route("/static/index.html")
 def index():
-    return send_from_directory("static", "index.html")
+    return send_from_directory(STATIC_DIR, "index.html")
 
 
 @app.route("/health")
 def health():
-    """Sonde utilisee par le lanceur : le serveur ne repond qu'apres le chargement
-    des modeles, et signale les transcriptions en cours avant un arret."""
-    active = sum(1 for job in jobs.values() if job["status"] not in ("done", "error"))
-    return jsonify({"status": "ok", "active_jobs": active})
+    with jobs_lock:
+        active = sum(1 for job in jobs.values() if job["status"] not in ("done", "error"))
+    try:
+        ytdlp_version = version("yt-dlp")
+    except PackageNotFoundError:
+        ytdlp_version = None
+    return jsonify(status="ok", pid=os.getpid(), active_jobs=active + int(live_slot.locked()),
+                   ytdlp_version=ytdlp_version)
 
 
 @app.route("/languages")
@@ -881,51 +983,82 @@ def languages():
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
-    data       = request.get_json() or {}
-    url        = data.get("url", "").strip()
-    language   = data.get("language", "auto").strip()
-    preprocess = bool(data.get("preprocess", True))
-    diarize    = bool(data.get("diarize", False))
-    test_mode  = int(data.get("test_mode", 0))
+    try:
+        data = _json_object()
+        options = _read_options(data)
+        url = _read_url(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return _start_job(run_transcription, (url, options), slots=transcription_slots)
 
-    if not url:
-        return jsonify({"error": "URL manquante"}), 400
-    if language not in SUPPORTED_LANGUAGES:
-        return jsonify({"error": f"Langue non supportée : {language}"}), 400
 
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = _new_job()
-    threading.Thread(
-        target=run_transcription,
-        args=(job_id, url, language, preprocess, diarize, test_mode),
-        daemon=True,
-    ).start()
-    return jsonify({"job_id": job_id})
+@app.route("/rediarize/<job_id>", methods=["POST"])
+def rediarize(job_id):
+    request.max_content_length = 8192
+    try:
+        speaker_options = _read_speaker_options(_json_object())
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    with jobs_lock:
+        source_job = jobs.get(job_id)
+        if source_job is None:
+            return jsonify({"error": "Job introuvable ou expiré."}), 404
+        if source_job["status"] != "done" or not source_job["rediarize_available"]:
+            return jsonify({"error": "Un résultat horodaté avec son audio source est nécessaire."}), 409
+        segments = source_job["segments"]
+        job = _new_job(source_job["title"], kind="rediarization")
+        job.update(speaker_options=speaker_options, duration_secs=source_job["duration_secs"],
+                   language=source_job["language"], model_used=source_job["model_used"])
+    return _start_job(run_rediarization, (segments, speaker_options), slots=transcription_slots,
+                      job=job, source_audio=_job_directory(job_id) / "source.wav")
 
 
 @app.route("/status/<job_id>")
 def status(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Job introuvable"}), 404
-    return jsonify(job)
+    summary = request.args.get("summary") == "1"
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is None:
+            return jsonify({"error": "Job introuvable ou expiré"}), 404
+        snapshot = job.copy()
+        logs = snapshot.pop("logs")
+        if not summary:
+            snapshot["logs"] = list(logs)
+        snapshot.pop("log_count")
+    if summary:
+        for key in ("transcript", "segments", "speakers", "diarization_turns"):
+            snapshot.pop(key)
+    return jsonify(snapshot)
 
 
 @app.route("/logs/<job_id>")
 def get_logs(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Job introuvable"}), 404
-    return jsonify({"logs": job["logs"]})
+    cursor = request.args.get("since", type=int)
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job is None:
+            return jsonify({"error": "Job introuvable ou expiré"}), 404
+        logs, count = list(job["logs"]), job["log_count"]
+    if cursor is not None:
+        logs = logs[max(0, cursor - (count - len(logs))):]
+    return jsonify({"logs": logs, "next": count})
 
 
 @app.route("/test-diarize")
 def test_diarize():
+    if not gpu_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "GPU occupé. Réessayez après le traitement en cours."})
     try:
         _get_diarization_pipeline()
-        return jsonify({"ok": True, "message": "Pipeline pyannote chargé — connexion et token valides."})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+        return jsonify({"ok": True, "message": "Pipeline pyannote chargé."})
+    except Exception:
+        app.logger.exception("Test pyannote impossible")
+        return jsonify({"ok": False, "error": (
+            "La détection des voix n’est pas disponible. Vérifiez l’accès à Community-1 "
+            "sur Hugging Face et le jeton HF_TOKEN dans le fichier .env."
+        )})
+    finally:
+        gpu_lock.release()
 
 
 @app.route("/download-audio/<job_id>")
@@ -940,27 +1073,18 @@ def download_audio(job_id):
 
 @app.route("/download-video", methods=["POST"])
 def download_video():
-    data    = request.get_json(silent=True) or {}
-    url     = str(data.get("url", "")).strip()
-    quality = str(data.get("quality", "best")).strip()
+    try:
+        data = _json_object()
+        url = _read_url(data)
+        quality = data.get("quality", "best")
+        if not isinstance(quality, str) or quality not in VIDEO_QUALITIES:
+            raise ValueError("Qualité non supportée.")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    if not url:
-        return jsonify({"error": "URL manquante"}), 400
-    # Refuse tout ce qui n'est pas une URL web (evite qu'une valeur soit lue comme option yt-dlp)
-    if not url.lower().startswith(("http://", "https://")):
-        return jsonify({"error": "URL invalide : http:// ou https:// attendu"}), 400
-    if quality not in VIDEO_QUALITIES:
-        return jsonify({"error": f"Qualité non supportée : {quality}"}), 400
-
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = _new_job(kind="video")
-    jobs[job_id].update({"progress": None, "video_available": False})
-    threading.Thread(
-        target=run_video_download,
-        args=(job_id, url, quality),
-        daemon=True,
-    ).start()
-    return jsonify({"job_id": job_id})
+    job = _new_job(kind="video")
+    job.update(progress=None, video_available=False)
+    return _start_job(run_video_download, (url, quality), slots=video_slots, job=job)
 
 
 @app.route("/download-video-file/<job_id>")
@@ -976,34 +1100,17 @@ def download_video_file(job_id):
 
 @app.route("/transcribe-file", methods=["POST"])
 def transcribe_file():
-    if "file" not in request.files:
-        return jsonify({"error": "Aucun fichier reçu"}), 400
-
-    f          = request.files["file"]
-    language   = request.form.get("language", "auto").strip()
-    preprocess = request.form.get("preprocess", "true").lower() == "true"
-    diarize    = request.form.get("diarize", "false").lower() == "true"
-    test_mode  = int(request.form.get("test_mode", "0") or "0")
-
-    if not f.filename:
-        return jsonify({"error": "Nom de fichier invalide"}), 400
-    if language not in SUPPORTED_LANGUAGES:
-        return jsonify({"error": f"Langue non supportée : {language}"}), 400
-
-    upload_dir = tempfile.mkdtemp(prefix="upload_")
-    ext        = os.path.splitext(f.filename)[1].lower() or ".bin"
-    safe_path  = os.path.join(upload_dir, f"input{ext}")
-    f.save(safe_path)
-
-    title  = os.path.splitext(f.filename)[0]
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = _new_job(title)
-    threading.Thread(
-        target=run_transcription_from_file,
-        args=(job_id, safe_path, upload_dir, language, preprocess, diarize, test_mode),
-        daemon=True,
-    ).start()
-    return jsonify({"job_id": job_id})
+    f = request.files.get("file")
+    if f is None or not f.filename:
+        return jsonify({"error": "Aucun fichier reçu."}), 400
+    try:
+        options = _read_options(request.form, form=True)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    title = Path(f.filename.replace("\\", "/")).stem[:200]
+    return _start_job(
+        run_transcription_from_file, (options,), slots=transcription_slots, job=_new_job(title), upload=f,
+    )
 
 
 @app.route("/speaker-audio/<job_id>/<speaker_id>")
@@ -1017,60 +1124,70 @@ def speaker_audio(job_id, speaker_id):
 
 @app.route("/api/transcribe-live", methods=["POST", "OPTIONS"])
 def transcribe_live():
-    # Pre-flight CORS
     if request.method == "OPTIONS":
         resp = app.make_default_options_response()
-        resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         return resp
 
-    if "audio" not in request.files:
-        return jsonify({"error": "Champ 'audio' manquant"}), 400
-
-    f          = request.files["audio"]
-    language   = request.form.get("language", "auto").strip()
-    preprocess = request.form.get("preprocess", "false").lower() == "true"
-
-    if language not in SUPPORTED_LANGUAGES:
-        return jsonify({"error": f"Langue non supportee : {language}"}), 400
-
-    tmpdir = tempfile.mkdtemp(prefix="live_")
+    request.max_content_length = LIVE_UPLOAD_LIMIT
+    if not live_slot.acquire(blocking=False):
+        return jsonify({"error": "Une dictée est déjà en cours."}), 429
     try:
-        ext      = os.path.splitext(f.filename or "audio.webm")[1].lower() or ".webm"
-        src_path = os.path.join(tmpdir, f"input{ext}")
-        wav_path = os.path.join(tmpdir, "audio.wav")
-        f.save(src_path)
-
+        f = request.files.get("audio")
+        if f is None:
+            return jsonify({"error": "Champ 'audio' manquant"}), 400
         try:
-            convert_to_wav(src_path, wav_path)
-        except subprocess.CalledProcessError:
-            return jsonify({"error": "Format audio non reconnu par ffmpeg"}), 422
+            language = _read_language(request.form)
+            preprocess = _read_bool(request.form, "preprocess", False, form=True)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
-        audio_data, sr = sf.read(wav_path, dtype="float32")
-        duration_secs  = len(audio_data) / sr
+        JOB_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="lexia_live_", dir=JOB_ROOT) as tmpdir:
+            src_path = os.path.join(tmpdir, "input")
+            wav_path = os.path.join(tmpdir, "audio.wav")
+            f.save(src_path)
+            try:
+                convert_to_wav(src_path, wav_path, LIVE_MAX_SECONDS + 1)
+            except subprocess.CalledProcessError:
+                return jsonify({"error": "Format audio non reconnu par FFmpeg."}), 422
+            duration = sf.info(wav_path).duration
+            if duration <= 0:
+                return jsonify({"error": "L'audio est vide."}), 422
+            if duration > LIVE_MAX_SECONDS:
+                return jsonify({"error": "La dictée est limitée à 120 secondes."}), 413
+            if preprocess:
+                preprocess_audio(wav_path)
 
-        if preprocess:
-            preprocess_audio(wav_path)
-
-        lang_param = None if language == "auto" else language
-        transcript, detected_lang = transcribe_with_whisper(wav_path, lang_param)
-
-        resp = jsonify({
-            "transcript":   transcript,
-            "language":     detected_lang,
-            "duration_secs": round(duration_secs, 2),
-        })
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp
-
-    except Exception as e:
-        print(f"[live] Erreur : {e}")
-        return jsonify({"error": "Erreur interne lors de la transcription"}), 500
-
+            if not gpu_lock.acquire(blocking=False):
+                return jsonify({"error": "GPU occupé. Réessayez dans un instant."}), 503
+            try:
+                segments, info = _whisper_segments(wav_path, language)
+                transcript = "\n".join(seg.text.strip() for seg in segments)
+            finally:
+                gpu_lock.release()
+            return jsonify(transcript=transcript, language=info.language, duration_secs=round(duration, 2))
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "La conversion audio a dépassé le délai maximal."}), 504
+    except Exception:
+        app.logger.exception("Erreur pendant la dictée")
+        return jsonify({"error": "Erreur interne lors de la transcription."}), 500
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        live_slot.release()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", debug=False, port=5000, threaded=True)
+    from waitress import serve
+
+    ensure_port_free(SERVER_PORT)
+    JOB_ROOT.mkdir(parents=True, exist_ok=True)
+    if not shutil.which(FFMPEG_BIN):
+        sys.exit("FFmpeg est introuvable dans le PATH.")
+    print("Chargement de Whisper large-v3...")
+    _whisper_model()
+    threading.Thread(target=_cleanup_loop, daemon=True).start()
+    serve(app, host="0.0.0.0", port=SERVER_PORT, threads=8,
+          max_request_body_size=app.config["MAX_CONTENT_LENGTH"], connection_limit=50)

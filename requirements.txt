@@ -1,13 +1,17 @@
 flask>=3.0.0
-faster-whisper>=1.0.0
+werkzeug>=3.1.9
+waitress==3.0.2
+faster-whisper>=1.2.1
 yt-dlp[default,deno]
 soundfile
 numpy
 scipy>=1.11.0
 noisereduce>=3.0.0
-pyannote.audio==3.3.2
+pyannote.audio==4.0.7
 python-dotenv>=1.0.0
 pystray>=0.19.5
 pillow>=10.0.0
 psutil>=5.9.0
-# PyTorch cu128 et NeMo installes separement via install.bat
+peft==0.12.0
+nemo-toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@75ee749762b97f41e8174c521d317f3dcff04052
+# Installer PyTorch CUDA et torchaudio via install.bat.

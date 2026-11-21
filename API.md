@@ -68,7 +68,7 @@ No job ID, no polling required.
 
 | Field        | Type    | Required | Default  | Description                                          |
 |--------------|---------|----------|----------|------------------------------------------------------|
-| `audio`      | file    | yes      | -        | Audio file binary. Any format supported by ffmpeg: WAV, MP3, WebM, OGG, M4A, FLAC, etc. |
+| `audio`      | file    | yes      | -        | Media file, e.g. WAV, MP3, WebM, OGG, M4A or FLAC. |
 | `language`   | string  | no       | `"auto"` | Language code from the supported list, or `"auto"` for automatic detection. |
 | `preprocess` | string  | no       | `"false"` | `"true"` to apply DSP chain (high-pass filter, noise reduction, normalization). Adds ~0.5s latency. Useful for noisy environments. |
 
@@ -167,7 +167,10 @@ async function transcribe(audioBlob, language = "fr") {
 | 30 seconds     | ~4-8 seconds                            |
 
 First request after server startup may be slower (model warm-up).
-Concurrent requests are handled correctly (Flask `threaded=True`).
+One live request is admitted at a time. A second live request returns `429`.
+If batch inference is using the GPU, live transcription returns `503` and can be retried.
+The live request limits are 16 MiB and 120 seconds. Batch uploads are capped
+at 512 MiB per request and 4 hours of decoded audio.
 
 ---
 
@@ -231,7 +234,14 @@ Queues a transcription job for a YouTube video. Returns immediately with a
 | `language`   | string  | no       | `"auto"` | Language code or `"auto"`.                    |
 | `preprocess` | boolean | no       | `true`  | Apply DSP audio preprocessing.                 |
 | `diarize`    | boolean | no       | `false` | Enable speaker diarization (requires HF_TOKEN).|
+| `timestamps` | boolean | no | `false` | Force Whisper even for English and return timed segments when speech is found. |
 | `test_mode`  | integer | no       | `0`     | Truncate audio to N seconds (0 = full audio).  |
+| `num_speakers` | integer | no | omitted | Exact speaker count, from 1 to 20, when diarization is enabled. |
+| `min_speakers` | integer | no | omitted | Optional lower bound, from 1 to 20. |
+| `max_speakers` | integer | no | omitted | Optional upper bound, from 1 to 20. |
+
+Specify either the exact count or the bounds. Invalid combinations return HTTP `400`.
+When four transcriptions have already been admitted, new requests return `429`.
 
 #### Response `200 OK`
 
@@ -262,6 +272,9 @@ Queues a transcription job for a local audio/video file upload.
 | `preprocess` | string  | no       | `"true"` | `"true"` / `"false"`.                         |
 | `diarize`    | string  | no       | `"false"` | `"true"` to enable speaker diarization.      |
 | `test_mode`  | string  | no       | `"0"`    | Truncate to N seconds for testing.             |
+
+The same speaker count fields are accepted as decimal strings in the multipart form.
+`timestamps` accepts the string `"true"` or `"false"`.
 
 #### Response `200 OK`
 
@@ -305,8 +318,11 @@ Returns the full state of a queued or completed job.
 |----------------|--------------------------------------------------|
 | `"queued"`     | Job is waiting to start.                         |
 | `"downloading"` | Downloading audio from YouTube.                 |
+| `"preparing"` | Converting or preprocessing the audio.          |
+| `"waiting_gpu"` | Waiting for the GPU.                          |
 | `"detecting"`  | Running language detection pass.                 |
 | `"transcribing"` | Model is running inference.                    |
+| `"diarizing"` | Identifying speakers.                           |
 | `"done"`       | Transcription complete. `transcript` is populated. |
 | `"error"`      | Failed. See `error` field for reason.            |
 
@@ -317,6 +333,16 @@ Returns the full state of a queued or completed job.
   { "start": 3.5, "end": 7.2, "text": "Second sentence.", "speaker": "Locuteur 1" }
 ]
 ```
+
+Diarized segments also include a stable `speaker_id` within the job. The corresponding
+speaker metadata includes `speech_secs`. `diarization_turns` contains the exclusive
+speaker intervals produced by the pipeline for evaluation. Use `?summary=1` to omit
+transcript, segments, speakers, diarization turns and logs while polling. The summary
+includes `processed_secs` when available.
+
+If speaker detection fails after transcription succeeds, the status remains `done`.
+`diarization_warning` contains a user-facing explanation. The transcript and timed
+segments remain available, and `rediarize_available` indicates whether detection can be retried.
 
 **`speakers`** (when `diarize=true`):
 ```json
@@ -351,12 +377,15 @@ progress details to the user.
   "logs": [
     { "ts": "14:32:01", "msg": "Conversion en WAV 16kHz mono...", "level": "step" },
     { "ts": "14:32:02", "msg": "WAV généré : 12.4 Mo @ 16000Hz mono", "level": "success" },
-    { "ts": "14:32:05", "msg": "[0.0s -> 3.5s] Bonjour.", "level": "segment" }
+    { "ts": "14:32:05", "msg": "Transcription terminée.", "level": "success" }
   ]
 }
 ```
 
-**`level` values:** `"step"`, `"model"`, `"segment"`, `"success"`, `"error"`, `"info"`
+**`level` values:** `"step"`, `"model"`, `"success"`, `"error"`, `"info"`
+
+The server stores the latest 256 events per job. Pass `?since=0` on the first request
+and then send the previous response's `next` value as the cursor.
 
 ---
 
@@ -402,8 +431,9 @@ or on failure:
 
 ### 10. `POST /download-video` - Async full video download
 
-Downloads the complete video (video + audio merged into MP4) with yt-dlp. No
-transcription is performed. Progress is exposed through `GET /status/<job_id>`.
+Downloads the complete video with yt-dlp. Separate streams are merged into MP4.
+Videos already in a single file may keep their original container. Progress is
+exposed through `GET /status/<job_id>`.
 
 #### Request
 
@@ -450,13 +480,28 @@ they are downloaded separately). `speed` is in bytes/s, `eta` in seconds.
 
 ### 11. `GET /download-video-file/<job_id>` - Retrieve the downloaded video
 
-Returns the video file once `video_available: true`. Files are kept in the
-system temp folder until the server restarts.
+Returns the video file once `video_available: true`. The filename uses the
+actual container extension. Completed job state and downloadable media expire
+after 24 hours. Jobs are held in memory and become unavailable after restart.
 
 #### Response `200 OK`
 - Content-Disposition: `attachment; filename="<title>.mp4"`
 
 ---
+
+### 12. `POST /rediarize/<job_id>` - Recalculate speakers of an existing transcription
+
+Use the ID of the original completed transcription when its status reports
+`rediarize_available: true`. Send a JSON object with the optional speaker count
+fields, for example `{"num_speakers": 2}`, or `{}` for automatic detection.
+The endpoint returns a new `job_id` in the same transcription queue. It returns
+`404` if the original job or audio has expired, `409` if it has no timed source,
+and `429` if the queue is full.
+
+Poll the new job as usual. Its `kind` is `rediarization`, and its `segments`
+share the exact timings and order of the original result. Apply only the new
+`speaker_id` and `speaker` fields when an editor already holds corrected text.
+Fetch speaker clips using the new ID and the playback MP3 using the original ID.
 
 ## Error Format
 
@@ -508,12 +553,9 @@ All error responses follow the same structure:
   `audio/webm` via `MediaRecorder`. Pass this directly - ffmpeg handles it.
 - **No auth:** No API key or session token needed. The server is intended for
   LAN use only.
-- **Concurrent requests:** The `/api/transcribe-live` endpoint is thread-safe.
-  Multiple simultaneous requests will queue on the GPU naturally.
-- **Max file size:** Flask default is unlimited; practical limit is GPU memory
-  (very long audio may cause OOM on `/api/transcribe-live`). For files longer
-  than ~5 minutes, prefer the async `/transcribe-file` endpoint.
-- **Cold start:** The first transcription request after server startup will be
-  ~2-5s slower as the GPU warms up.
+- **Concurrent requests:** The GPU handles one inference operation at a time.
+  Use the batch endpoint for recordings longer than two minutes.
+- **Cold start:** Whisper loads before readiness. Canary and Community-1 load on
+  their first use, so their first job can take longer.
 - **Server address:** LEX-IA listens on `0.0.0.0:5000`. Find the host machine's
   LAN IP with `ipconfig` (Windows) or `ip addr` (Linux).

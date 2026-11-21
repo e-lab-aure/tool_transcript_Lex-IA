@@ -1,73 +1,40 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 
-echo ============================================
-echo  Whisper Transcriber - Installation
-echo  CUDA 12.8 / PyTorch 2.8 / NeMo trunk
-echo ============================================
-echo.
-
-REM -- Verifier Python
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo [ERREUR] Python introuvable dans le PATH.
-    echo Installe Python 3.11 ou 3.12 depuis https://www.python.org
-    pause
+where ffmpeg.exe >nul 2>&1 || (
+    echo [ERREUR] FFmpeg est introuvable dans le PATH.
+    exit /b 1
+)
+where git.exe >nul 2>&1 || (
+    echo [ERREUR] Git est introuvable dans le PATH.
+    exit /b 1
+)
+if not exist ".venv\Scripts\python.exe" (
+    py -3.12 -m venv .venv || (
+        echo [ERREUR] Installe Python 3.12 x64 avec le lanceur py.exe.
+        exit /b 1
+    )
+)
+set "PY=.venv\Scripts\python.exe"
+"%PY%" -c "import struct, sys; sys.exit(0 if sys.version_info[:2] == (3, 12) and struct.calcsize('P') == 8 else 1)" || (
+    echo [ERREUR] Le virtualenv doit utiliser Python 3.12 x64. Renomme .venv avant de relancer.
     exit /b 1
 )
 
-echo [1/5] Creation du virtualenv...
-python -m venv .venv
-if errorlevel 1 (
-    echo [ERREUR] Creation du virtualenv echouee.
-    pause
-    exit /b 1
-)
+echo [1/3] Installation de PyTorch CUDA 12.8...
+"%PY%" -m pip install --index-url https://download.pytorch.org/whl/cu128 "torch==2.8.0+cu128" "torchaudio==2.8.0+cu128" || goto :failed
 
-echo [2/5] Mise a jour de pip...
-.venv\Scripts\python.exe -m pip install --upgrade pip --quiet
+echo [2/3] Installation des dependances...
+"%PY%" -m pip install -r requirements.txt -c constraints-windows.txt || goto :failed
 
-echo [3/5] Installation de PyTorch 2.8 cu128...
-.venv\Scripts\python.exe -m pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-if errorlevel 1 (
-    echo [ERREUR] Installation de PyTorch echouee.
-    pause
-    exit /b 1
-)
+echo [3/3] Verification...
+"%PY%" -m pip check || goto :failed
+"%PY%" -c "import app, torch, waitress; assert torch.cuda.is_available(), 'CUDA non disponible'; print(torch.cuda.get_device_name(0))" || goto :failed
 
-echo [4/5] Installation des dependances de base...
-.venv\Scripts\python.exe -m pip install flask>=3.0.0 faster-whisper>=1.0.0 "yt-dlp[default,deno]" pystray>=0.19.5 pillow>=10.0.0 psutil>=5.9.0
-if errorlevel 1 (
-    echo [ERREUR] Installation des dependances echouee.
-    pause
-    exit /b 1
-)
+echo Installation terminee. Lance tray.bat ou run.bat.
+exit /b 0
 
-echo [5/5] Installation de NeMo trunk (Canary-Qwen-2.5B)...
-echo      ^(peut prendre 10-15 min, ~5 Go^)
-.venv\Scripts\python.exe -m pip install "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git"
-if errorlevel 1 (
-    echo [ERREUR] Installation de NeMo echouee.
-    echo Verifie que git est installe et dans ton PATH.
-    pause
-    exit /b 1
-)
-
-echo [5b/5] Fix compatibilite peft / Canary-Qwen-2.5B ^(Qwen3Model^)...
-.venv\Scripts\python.exe -m pip install "peft==0.12.0"
-if errorlevel 1 (
-    echo [ERREUR] Fix peft echoue.
-    pause
-    exit /b 1
-)
-
-echo.
-echo [TEST] Verification CUDA...
-.venv\Scripts\python.exe -c "import torch; print('  PyTorch :', torch.__version__); print('  CUDA dispo :', torch.cuda.is_available()); print('  GPU :', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NON DETECTE')"
-
-echo.
-echo ============================================
-echo  Installation terminee !
-echo  Lance run.bat pour demarrer le serveur.
-echo ============================================
-pause
+:failed
+echo [ERREUR] Installation ou verification incomplete. Consulte la sortie ci-dessus.
+exit /b 1

@@ -1,24 +1,37 @@
 # LEX-IA
 
-Transcripteur audio/vidéo local propulsé par GPU NVIDIA.
+LEX-IA transcrit des enregistrements et des vidéos YouTube sur un ordinateur équipé d’un GPU NVIDIA.
 
-## Stack
-- **Canary-Qwen-2.5B** (NeMo) — anglais, chunking 40s
-- **Whisper large-v3** (faster-whisper) — toutes les autres langues
-- **yt-dlp** + **deno** — extraction audio/vidéo (deno résout les challenges JS de YouTube, installé dans le venv)
-- **ffmpeg** — conversion audio
-- **Flask** — serveur web local
+## Premiers pas
+
+1. Lance `tray.bat`. Quand l’icône près de l’horloge devient verte, double-clique dessus pour ouvrir LEX-IA.
+2. Choisis **Transcrire un lien** pour une vidéo YouTube, **Transcrire un fichier** pour un enregistrement local ou **Télécharger une vidéo** pour récupérer un MP4.
+3. Une fois la transcription prête, choisis **Relire et corriger** pour modifier le texte en écoutant l’audio. Tu peux aussi exporter directement depuis le résultat.
+
+Pour un entretien dont tu connais les participants, coche **Distinguer les personnes qui parlent** et indique le **Nombre exact**. Pour une vidéo où tu connais seulement la limite, utilise **Nombre maximal**. Sinon, garde **Autodétection**.
 
 ## Prérequis
-- Python 3.11 ou 3.12
-- GPU NVIDIA avec CUDA 12.8
+- Windows x64 et Python 3.12 avec le lanceur `py.exe`
+- GPU NVIDIA avec pilote compatible CUDA 12.8, bibliothèques CUDA 12 et cuDNN 9 accessibles à CTranslate2
 - ffmpeg dans le PATH
 - Git (pour l'installation de NeMo)
 
 ## Installation
+
+Depuis l'explorateur ou une invite de commandes Windows :
+
 ```bat
 install.bat
 ```
+
+Le script réutilise ou crée `.venv`, installe les versions de [constraints-windows.txt](constraints-windows.txt)
+et vérifie CUDA. Pour repartir de zéro, arrête LEX-IA, renomme `.venv` en `.venv.old`,
+puis relance le script. Les modèles sont téléchargés à leur première utilisation.
+
+Pour activer la diarisation, copie `.env.example` en `.env`, accepte les conditions
+de [Community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) et
+renseigne `HF_TOKEN`. Dans les **Réglages avancés**, **Vérifier la détection des voix** vérifie le chargement du modèle local.
+Un jeton précédemment utilisé pour pyannote 3.1 peut être réutilisé s'il a accès à Community-1.
 
 ## Lancement
 
@@ -29,17 +42,17 @@ tray.bat
 Une icône apparaît près de l'horloge et pilote le serveur sans console.
 
 Menu (clic droit) :
-- **Ouvrir l'interface** — http://localhost:5000 (double-clic sur l'icône)
-- **Démarrer** / **Suspendre** / **Reprendre** / **Redémarrer** / **Arrêter**
+- **Ouvrir LEX-IA** ouvre http://localhost:5000, comme le double-clic sur l’icône.
+- **Démarrer le serveur**, **Suspendre**, **Reprendre**, **Redémarrer le serveur** et **Arrêter le serveur** pilotent le serveur.
 - **Ouvrir le journal** — sortie du serveur dans `logs/server.log`
-- **Démarrer avec Windows** — crée le raccourci de démarrage de session
-- **Démarrer le serveur automatiquement** — lance le serveur avec l'icône
+- **Afficher l’icône au démarrage de Windows** crée le raccourci de démarrage de session.
+- **Démarrer le serveur avec l’icône** lance le serveur à l’ouverture de l’icône.
 
 Couleur de l'icône : gris = arrêté, bleu = démarrage, vert = prêt, orange = suspendu, rouge = erreur.
 
-Le serveur ne répond qu'après le chargement des deux modèles, ce qui prend une à
-deux minutes. **Suspendre** gèle le processus mais garde la VRAM allouée ; seul
-**Arrêter** décharge les modèles du GPU.
+Le serveur devient prêt après le chargement de Whisper. Canary et pyannote se chargent
+à leur première utilisation. **Suspendre** gèle le processus mais garde la VRAM allouée ; seul
+**Arrêter le serveur** décharge les modèles du GPU.
 
 ### Console
 ```bat
@@ -48,28 +61,64 @@ run.bat
 
 ## Démarrage automatique de Windows
 
-Coche **Démarrer avec Windows** dans le menu de l'icône. Un raccourci est créé
+Coche **Afficher l’icône au démarrage de Windows** dans le menu de l’icône. Un raccourci est créé
 dans le dossier de démarrage de la session, sans droits administrateur. Décoche
 pour le retirer.
 
 ## Mise à jour yt-dlp
-yt-dlp (avec deno et yt-dlp-ejs) est mis à jour automatiquement à chaque démarrage du serveur (avant le
-chargement des modèles). En cas d'échec (hors ligne), la version installée est
-conservée. Pour désactiver : `LEXIA_SKIP_YTDLP_UPDATE=1` dans `.env`.
 
-Mise à jour manuelle :
+Si un site change et que son téléchargement échoue, arrête LEX-IA puis lance :
 ```bat
 update.bat
 ```
+
+Le serveur utilise la version de yt-dlp déjà installée, sans mise à jour au démarrage.
+Consulte **Mode d’emploi → Module YouTube** dans l’application pour voir la version utilisée.
+Relance le serveur après `update.bat`. Une réinstallation réapplique les versions
+verrouillées, y compris celle de yt-dlp.
 
 ## Architecture
 
 ![Architecture LEX-IA](docs/lex_ia_architecture.svg)
 
-## Fonctionnalités
-- URL YouTube ou fichier local (drag & drop)
-- Onglet **Vidéo** : téléchargement de la vidéo complète (yt-dlp, MP4, qualité au choix)
-- Détection automatique de la langue
-- Routage intelligent vers le meilleur modèle
-- Console IA en temps réel
-- Export transcript en .txt
+
+Whisper large-v3 transcrit les passages horodatés et les langues autres que l’anglais. Canary-Qwen-2.5B peut transcrire l’anglais sans horodatage. pyannote Community-1 distingue les voix, yt-dlp et Deno récupèrent les sources, FFmpeg traite les médias, et Flask et Waitress servent l’application sur le réseau local.
+
+## Corriger et exporter
+
+Dans **Relire et corriger**, **Nommer ou fusionner les voix** affiche le temps de parole
+et permet d’écouter un extrait avant de renommer ou de fusionner une voix. Pour
+défaire une fusion, efface son choix dans cette fenêtre.
+
+Ouvre **Ajuster la détection des voix** et choisis **Relancer la détection** pour
+recalculer les attributions sur les passages existants. Le texte et les repères de
+temps sont conservés. **Annuler la dernière correction des voix** rétablit les
+anciennes attributions, les noms et les fusions, y compris après une relance.
+Si la détection échoue, tu peux toujours relire et exporter le texte.
+
+Filtre les passages par locuteur pour écouter un extrait et change le locuteur
+d'un passage directement près de son timestamp. Le menu **Exporter** reprend le
+texte corrigé dans l'ensemble du lecteur, même si un filtre est actif.
+
+- **TXT** pour le texte et **JSON** pour les passages horodatés, les locuteurs et les tours bruts du modèle.
+- **SRT** ou **VTT** pour les sous-titres. Laisse **Activer les repères de temps et les sous-titres**
+  coché pour obtenir des passages horodatés, y compris en anglais. Ce réglage choisit
+  Whisper. Décoche-le pour laisser Canary transcrire l'anglais sans timestamps.
+
+Le WAV nécessaire à la relance est conservé temporairement avec le résultat,
+environ 110 Mio par heure d'audio. Les exports téléchargés restent sur ton ordinateur.
+
+Pour comparer les réglages sur un entretien ou une vidéo, suis le
+[protocole d'évaluation](docs/evaluation-diarisation.md).
+
+Quatre transcriptions peuvent être admises à la fois et sont traitées dans l'ordre d'arrivée.
+Deux téléchargements vidéo peuvent tourner en parallèle. Les résultats et leurs médias
+expirent après 24 heures. Les corrections restent dans l’onglet. Exporte-les pour les conserver.
+
+Les tests locaux utilisent FFmpeg et ne téléchargent aucun modèle :
+
+```bat
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Avec Node.js installé, `node tests/test_editor.cjs` vérifie le lecteur, les fusions et le suivi des jobs.

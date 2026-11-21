@@ -1,12 +1,12 @@
 @echo off
-if not exist .venv (
-    echo ERREUR : Le virtualenv n'existe pas. Lance install.bat d'abord.
-    pause
+setlocal
+cd /d "%~dp0"
+if not exist ".venv\Scripts\python.exe" (
+    echo [ERREUR] Lance install.bat d'abord.
     exit /b 1
 )
-
-echo Demarrage du serveur sur http://localhost:5000
-echo Appuie sur Ctrl+C pour arreter.
-echo.
-.venv\Scripts\python.exe app.py
-pause
+set "PYTHONUTF8=1"
+set "PYTHONUNBUFFERED=1"
+echo Ouverture sur http://localhost:5000 apres le chargement de Whisper.
+".venv\Scripts\python.exe" app.py
+exit /b %errorlevel%

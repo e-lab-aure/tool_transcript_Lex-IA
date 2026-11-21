@@ -56,12 +56,12 @@ STOPPING = "stopping"
 FAILED   = "failed"
 
 STATE_LABELS = {
-    STOPPED:  "Arrete",
-    STARTING: "Demarrage (chargement des modeles)...",
-    RUNNING:  "En cours",
+    STOPPED:  "Arrêté",
+    STARTING: "Démarrage en cours...",
+    RUNNING:  "Prêt",
     PAUSED:   "Suspendu",
-    STOPPING: "Arret en cours...",
-    FAILED:   "Arrete apres une erreur",
+    STOPPING: "Arrêt en cours...",
+    FAILED:   "Arrêté après une erreur",
 }
 
 STATE_COLORS = {
@@ -372,18 +372,23 @@ class ServerController:
         """Interroge /health ; renvoie None si le serveur ne repond pas."""
         try:
             with urllib.request.urlopen(HEALTH_URL, timeout=HEALTH_TIMEOUT) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                data = json.loads(resp.read().decode("utf-8"))
+                with self._lock:
+                    if (isinstance(data, dict) and self._proc
+                            and data.get("pid") == self._proc.pid and data.get("status") == "ok"):
+                        return data
+                return None
         except (urllib.error.URLError, OSError, ValueError, TimeoutError):
             return None
 
-    def active_jobs(self) -> int:
+    def active_jobs(self) -> int | None:
         data = self.health()
         if not data:
-            return 0
+            return None
         try:
             return int(data.get("active_jobs", 0))
         except (TypeError, ValueError):
-            return 0
+            return None
 
     def poll(self) -> str | None:
         """Rafraichit l'etat. Renvoie un message a notifier, le cas echeant."""
@@ -407,7 +412,7 @@ class ServerController:
                 return None
             elapsed = time.monotonic() - self._started_at
 
-        # Etat STARTING : le serveur ne repond qu'une fois les modeles charges.
+        # Etat STARTING : le serveur ne repond qu'une fois Whisper charge.
         # La requete reseau est faite hors verrou pour ne pas bloquer le menu.
         if self.health() is not None:
             self._set_state(RUNNING)
@@ -446,14 +451,14 @@ class TrayApp:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Ouvrir l'interface",
+                "Ouvrir LEX-IA",
                 self._on_open,
                 default=True,
                 enabled=lambda _: self.server.state == RUNNING,
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Demarrer",
+                "Démarrer le serveur",
                 self._on_start,
                 enabled=lambda _: self.server.state in (STOPPED, FAILED),
             ),
@@ -463,29 +468,29 @@ class TrayApp:
                 enabled=lambda _: self.server.state in (RUNNING, PAUSED),
             ),
             pystray.MenuItem(
-                "Redemarrer",
+                "Redémarrer le serveur",
                 self._on_restart,
                 enabled=lambda _: self.server.is_active(),
             ),
             pystray.MenuItem(
-                "Arreter",
+                "Arrêter le serveur",
                 self._on_stop,
                 enabled=lambda _: self.server.is_active(),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Ouvrir le journal", self._on_open_log),
             pystray.MenuItem(
-                "Demarrer avec Windows",
+                "Afficher l’icône au démarrage de Windows",
                 self._on_toggle_startup,
                 checked=lambda _: os.path.isfile(_startup_shortcut_path()),
             ),
             pystray.MenuItem(
-                "Demarrer le serveur automatiquement",
+                "Démarrer le serveur avec l’icône",
                 self._on_toggle_autostart,
                 checked=lambda _: self.config["autostart_server"],
             ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quitter", self._on_quit),
+            pystray.MenuItem("Quitter LEX-IA", self._on_quit),
         )
 
     def _refresh_icon(self) -> None:
@@ -515,22 +520,28 @@ class TrayApp:
             self.server.pause()
 
     def _on_restart(self, *_) -> None:
-        if self._confirm_interrupt("redemarrer"):
+        if self._confirm_interrupt("redémarrer"):
             self.server.restart()
 
     def _on_stop(self, *_) -> None:
-        if self._confirm_interrupt("arreter"):
+        if self._confirm_interrupt("arrêter"):
             self.server.stop()
 
     def _confirm_interrupt(self, action: str) -> bool:
         """Previent si une transcription est en cours avant de couper le serveur."""
+        if self.server.state == PAUSED:
+            return _confirm("LEX-IA", f"Des traitements peuvent etre suspendus. Veux-tu {action} ?")
         count = self.server.active_jobs()
+        if count is None:
+            if self.server.state == STARTING:
+                return True
+            return _confirm("LEX-IA", f"Etat des traitements inconnu. Veux-tu {action} ?")
         if count <= 0:
             return True
         return _confirm(
             "LEX-IA",
-            f"{count} transcription(s) en cours seront perdues.\n\n"
-            f"Veux-tu quand meme {action} le serveur ?",
+            f"Nombre de traitements qui seront interrompus : {count}.\n\n"
+            f"Voulez-vous quand même {action} le serveur ?",
         )
 
     def _on_open_log(self, *_) -> None:
@@ -555,7 +566,7 @@ class TrayApp:
         self.icon.update_menu()
 
     def _on_quit(self, *_) -> None:
-        if self.server.is_active() and not self._confirm_interrupt("quitter et arreter"):
+        if self.server.is_active() and not self._confirm_interrupt("quitter LEX-IA et arrêter"):
             return
         self._stopping.set()
         self.server.stop()
